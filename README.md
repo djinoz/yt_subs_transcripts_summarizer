@@ -1,5 +1,7 @@
 # YouTube Subscriptions Transcript Summarizer
 
+Cutdown on the number of videos I watch by getting my subscriptions fresh vids summarized in Joplin to review before watching.
+
 Fetch transcripts for the **latest videos from channels you're subscribed to** and save **Markdown summaries** (perfect for Joplin).
 
 ## What it does
@@ -9,9 +11,10 @@ Fetch transcripts for the **latest videos from channels you're subscribed to** a
 - Collects the most recent videos across all those channels (or specific playlists/URLs).
 - Pulls transcripts (including auto‑generated when available) via `youtube-transcript-api`.
 - Summarizes each transcript:
-  - **Local** TextRank (fallback, no API keys required), or
+  - **Local** TextRank (fallback, no API keys required, pretty crap), or
   - **OpenAI** (recommended if `OPENAI_API_KEY` is set) for high-quality structured summaries.
-- Writes clean **Markdown** files to a folder you can point Joplin at (e.g. a Syncthing folder).
+- Writes clean **Markdown** files to a folder you can point Joplin at.
+- I use the "Hotfolder" plugin for Joplin that monitors the above folder for new .md files. 
 
 ## Features
 
