@@ -686,14 +686,26 @@ def summarize_openai(text: str, api_key: str, model: str = "gpt-4o-mini") -> Dic
 def save_markdown(out_dir: pathlib.Path, video: Dict, transcript_info: Dict[str, str], summary_block: str):
     out_dir.mkdir(parents=True, exist_ok=True)
     published = iso_to_dt(video["publishedAt"]).astimezone(dt.timezone.utc).strftime("%Y-%m-%d")
-    safe_title = "".join(c for c in video["title"] if c not in r'\/:*?"<>|').strip()
-    path = out_dir / f"{published} - {video['channelTitle']} - {safe_title} ({video['videoId']}).md"
+    # Decode HTML entities first, then clean for filesystem
+    clean_title = html.unescape(video["title"])
+    safe_title = "".join(c for c in clean_title if c not in r'\/:*?"<>|').strip()
+    # New filename format: TITLE - DATE
+    path = out_dir / f"{safe_title} - {published}.md"
     url = f"https://www.youtube.com/watch?v={video['videoId']}"
     lang = transcript_info.get("lang", "unknown")
     translated = transcript_info.get("translated", False)
-    md = f"""---
-title: "{video['title']}"
-channel: "{video['channelTitle']}"
+    # YAML moved to bottom - decode HTML entities for clean display
+    md = f"""# {clean_title}
+**Channel:** {html.unescape(video['channelTitle'])}  
+**Published:** {video['publishedAt']}  
+**Link:** {url}
+
+## Summary
+{summary_block}
+
+---
+title: "{clean_title}"
+channel: "{html.unescape(video['channelTitle'])}"
 video_id: "{video['videoId']}"
 published_at: "{video['publishedAt']}"
 source_url: "{url}"
@@ -701,20 +713,9 @@ transcript_language: "{lang}"
 transcript_translated: {str(bool(translated)).lower()}
 ---
 
-# {video['title']}
-**Channel:** {video['channelTitle']}  
-**Published:** {video['publishedAt']}  
-**Link:** {url}
-
-## Summary
-{summary_block}
-
-<details>
-<summary>Transcript (collapsed)</summary>
+## Transcript
 
 {transcript_info['text']}
-
-</details>
 """
     path.write_text(md, encoding="utf-8")
     return str(path)
