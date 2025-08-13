@@ -22,6 +22,7 @@ Fetch transcripts for the **latest videos from channels you're subscribed to** a
 - **Multiple modes**: Process subscriptions, specific playlists, or individual video URLs
 - **Smart filtering**: Skip shorts, already processed videos, and videos from your watch history
 - **Rate limiting protection**: Safe to run regularly without hitting YouTube API limits
+- **Quota exhaustion handling**: Gracefully processes any retrieved videos even if API quota is exceeded
 - **IP blocking protection**: Graceful error handling with helpful troubleshooting messages
 - **State tracking**: Remembers processed videos to avoid duplicates
 - **High-quality summaries**: OpenAI generates structured summaries with TL;DR, key takeaways, and action items
@@ -62,6 +63,13 @@ python yt_subs_summarizer.py --dryrun --show-transcripts
 The first run will open a browser window to authorize read‑only access to your YouTube account. Summaries will land in `./ToJoplin` (or change `OUTPUT_DIR` in `.env`).
 
 ## Troubleshooting
+
+### YouTube API Quota Exhaustion
+If you see `[QUOTA] YouTube API quota exhausted` messages:
+- **This is normal** - YouTube limits API usage to 10,000 units per day
+- **Videos are still processed** - Any videos retrieved before quota exhaustion are summarized normally
+- **Automatic recovery** - The script will continue on next run when quota resets (daily at midnight Pacific)
+- **Optimized for scheduled runs** - Current settings use ~5,400 units/day with 4-hour intervals, leaving safety buffer
 
 ### IP Blocking Issues
 If you get "YouTube is blocking requests from your IP address":
@@ -130,6 +138,7 @@ Key libraries used:
 
 **v2025.08.13** - Major improvements:
 - ✅ **New efficient API method** - 95% fewer YouTube API calls (now default)
+- ✅ **Quota exhaustion handling** - Gracefully processes videos even when API quota is exceeded
 - ✅ Fixed IP blocking issues with updated transcript API  
 - ✅ Enhanced OpenAI integration with structured summaries
 - ✅ Added graceful error handling and troubleshooting

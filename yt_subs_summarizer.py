@@ -38,6 +38,10 @@ import datetime as dt
 from typing import List, Dict, Optional, Tuple, Set
 
 from dotenv import load_dotenv
+
+# Global flag to track quota exhaustion
+QUOTA_EXHAUSTED = False
+
 from tqdm import tqdm
 
 # HTTP + parsing (for yt-dlp fallback)
@@ -188,12 +192,26 @@ def _should_retry(status: int, reason: Optional[str]) -> bool:
     return (status in (500, 502, 503, 504, 429)) or (status == 403 and reason in ("rateLimitExceeded","userRateLimitExceeded","quotaExceeded"))
 
 def _execute_with_backoff(request, what: str, max_attempts: int = 5):
+    global QUOTA_EXHAUSTED
+    
+    # If quota is already exhausted, don't make any more API calls
+    if QUOTA_EXHAUSTED:
+        print(f"[skip] {what}: Quota exhausted, abandoning API calls", file=sys.stderr)
+        return None
+    
     delay = 1.0
     for attempt in range(1, max_attempts + 1):
         try:
             return request.execute()
         except HttpError as e:
             status, reason = _http_error_reason(e)
+            
+            # Check for quota exhaustion
+            if status == 403 and reason == "quotaExceeded":
+                QUOTA_EXHAUSTED = True
+                print(f"[QUOTA] {what}: YouTube API quota exhausted. Abandoning further API calls but will process any videos already retrieved.", file=sys.stderr)
+                return None
+                
             if status in (403, 404) and (reason in (
                 "playlistNotFound",
                 "playlistItemsNotAccessible",
@@ -811,30 +829,55 @@ def main():
                 )
                 human_context = "Subscriptions (Efficient API)"
                 print(f"Candidates from efficient API: {len(candidates)}")
+                
+                # Check if quota was exhausted during retrieval
+                if QUOTA_EXHAUSTED:
+                    print(f"⚠️  API quota exhausted during video retrieval. Will process {len(candidates)} videos that were retrieved before quota limit.")
+                    
             except Exception as e:
                 print(f"[error] Efficient API failed: {e}", file=sys.stderr)
-                print(f"Please disable YT_USE_EFFICIENT_API in .env and try the legacy method if needed.", file=sys.stderr)
-                sys.exit(1)
+                # If quota exhausted, don't exit - we might have some candidates to process
+                if not QUOTA_EXHAUSTED:
+                    print(f"Please disable YT_USE_EFFICIENT_API in .env and try the legacy method if needed.", file=sys.stderr)
+                    sys.exit(1)
+                else:
+                    print("Quota exhausted - will process any videos retrieved before the limit.", file=sys.stderr)
+                    candidates = []  # No candidates if we failed due to quota
         else:
             print("⚠️  WARNING: Using legacy uploads playlist method - this may cause YouTube API rate limiting!")
             print("   Recommend setting YT_USE_EFFICIENT_API=1 for much better performance.")
-            uploads = get_subscribed_upload_playlists(youtube)
-            print(f"Found {len(uploads)} subscriptions with uploads playlists.")
-            candidates = iter_recent_from_uploads(
-                youtube,
-                uploads,
-                per_channel_max_age_days=cfg["YT_MAX_AGE_DAYS"],
-                per_channel_limit=cfg["YT_PER_CHANNEL_LIMIT"],
-                dryrun=args.dryrun
-            )
-            human_context = "Subscriptions (Legacy Method)"
-            print(f"Candidates after per-channel age & cap: {len(candidates)}")
+            try:
+                uploads = get_subscribed_upload_playlists(youtube)
+                print(f"Found {len(uploads)} subscriptions with uploads playlists.")
+                candidates = iter_recent_from_uploads(
+                    youtube,
+                    uploads,
+                    per_channel_max_age_days=cfg["YT_MAX_AGE_DAYS"],
+                    per_channel_limit=cfg["YT_PER_CHANNEL_LIMIT"],
+                    dryrun=args.dryrun
+                )
+                human_context = "Subscriptions (Legacy Method)"
+                print(f"Candidates after per-channel age & cap: {len(candidates)}")
+                
+                # Check if quota was exhausted during retrieval
+                if QUOTA_EXHAUSTED:
+                    print(f"⚠️  API quota exhausted during video retrieval. Will process {len(candidates)} videos that were retrieved before quota limit.")
+                    
+            except Exception as e:
+                print(f"[error] Legacy API failed: {e}", file=sys.stderr)
+                if QUOTA_EXHAUSTED:
+                    print("Quota exhausted - will process any videos retrieved before the limit.", file=sys.stderr)
+                    candidates = []  # No candidates if we failed due to quota
+                else:
+                    raise
 
     # Shorts exclusion (all modes)
-    if cfg["EXCLUDE_SHORTS"] and candidates:
+    if cfg["EXCLUDE_SHORTS"] and candidates and not QUOTA_EXHAUSTED:
         before = len(candidates)
         candidates = exclude_shorts(youtube, candidates, cfg["SHORTS_MAX_SECONDS"])
         print(f"After Shorts filter: kept {len(candidates)}/{before}")
+    elif cfg["EXCLUDE_SHORTS"] and candidates and QUOTA_EXHAUSTED:
+        print(f"Skipping Shorts filter due to quota exhaustion. Processing {len(candidates)} videos as-is.")
 
     # Unwatched proxy: remove already processed & (optionally) watched via Takeout
     before = len(candidates)
@@ -929,7 +972,15 @@ def main():
 
     if not args.skip_state:
         save_state(state_file, processed_ids)
-    print(f"Done. Markdown files saved to: {out_dir.resolve()} (wrote {saved} files)")
+    
+    # Final summary message
+    if QUOTA_EXHAUSTED:
+        print(f"✓ Completed processing despite YouTube API quota exhaustion.")
+        print(f"  Processed {saved} videos that were retrieved before quota limit.")
+        print(f"  Markdown files saved to: {out_dir.resolve()}")
+        print(f"  Script will retry remaining videos on next scheduled run (quota resets daily).")
+    else:
+        print(f"Done. Markdown files saved to: {out_dir.resolve()} (wrote {saved} files)")
 
 if __name__ == "__main__":
     main()
