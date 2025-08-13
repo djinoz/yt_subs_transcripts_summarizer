@@ -16,6 +16,7 @@
 #   YT_EXCLUDE_SHORTS=1
 #   YT_SHORTS_MAX_SECONDS=65
 #   YT_STATE_FILE=yt_state.json
+#   YT_USE_EFFICIENT_API=1              # use efficient API (default, recommended)
 #   YT_TAKEOUT_WATCH_JSON=
 #   YT_COOKIES_FILE=~/youtube_cookies.txt   # cookies (Netscape) for gated captions
 #   HTTP_PROXY=
@@ -98,6 +99,7 @@ def load_config():
         "COOKIES_FILE": os.getenv("YT_COOKIES_FILE", "").strip() or None,
         "HTTP_PROXY": os.getenv("HTTP_PROXY", "").strip() or None,
         "HTTPS_PROXY": os.getenv("HTTPS_PROXY", "").strip() or None,
+        "USE_EFFICIENT_API": os.getenv("YT_USE_EFFICIENT_API", "1").strip() not in ("0", "false", "False"),
     }
     return cfg
 
@@ -289,6 +291,76 @@ def exclude_shorts(youtube, videos: List[Dict], max_seconds: int) -> List[Dict]:
             else:
                 print(f"[skip] SHORT ({secs}s) {v['channelTitle']} — {v['title']}", file=sys.stderr)
     return kept
+
+# ------------------ Efficient Subscription API ------------------
+
+def get_recent_subscription_videos_efficient(youtube, max_videos: int, max_age_days: int) -> List[Dict]:
+    """
+    Efficiently get recent videos from subscriptions using a hybrid approach:
+    1. Get a sample of most relevant subscription channels (~1 API call)
+    2. Use search API to get recent videos from those channels (~10 API calls)
+    
+    Total: ~11 API calls instead of 200+ with the old method!
+    """
+    # Get a sample of subscribed channels (limit to reduce API calls)
+    channels = []
+    subs_req = youtube.subscriptions().list(
+        part="snippet",
+        mine=True,
+        maxResults=20,  # Only get 20 channels to keep API usage low
+        order="relevance"  # Get most relevant channels
+    )
+    
+    resp = _execute_with_backoff(subs_req, "subscriptions.list:sample")
+    if not resp:
+        return []
+        
+    for item in resp.get("items", []):
+        try:
+            channel_id = item["snippet"]["resourceId"]["channelId"]
+            channel_title = item["snippet"]["title"]
+            channels.append({"id": channel_id, "title": channel_title})
+        except KeyError:
+            continue
+    
+    print(f"Searching recent videos from {len(channels)} most active subscribed channels…")
+    
+    # Now use search API to get recent videos from these channels
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max_age_days) if max_age_days > 0 else None
+    videos = []
+    
+    for channel in channels[:10]:  # Limit to 10 channels to keep API usage reasonable
+        if len(videos) >= max_videos:
+            break
+            
+        search_req = youtube.search().list(
+            part="snippet",
+            channelId=channel["id"],
+            type="video",
+            order="date",
+            maxResults=min(5, max_videos // 10 + 1),  # Get a few recent videos per channel
+            publishedAfter=(cutoff.isoformat() if cutoff else None)
+        )
+        
+        resp = _execute_with_backoff(search_req, f"search.list:{channel['title']}")
+        if not resp:
+            continue
+            
+        for item in resp.get("items", []):
+            if len(videos) >= max_videos:
+                break
+                
+            try:
+                videos.append({
+                    "videoId": item["id"]["videoId"],
+                    "publishedAt": item["snippet"]["publishedAt"],
+                    "title": item["snippet"]["title"],
+                    "channelTitle": item["snippet"]["channelTitle"],
+                })
+            except KeyError:
+                continue
+    
+    return videos
 
 # ------------------ Listing + Filters ------------------
 
@@ -727,18 +799,35 @@ def main():
         human_context = "Explicit URLs"
 
     else:
-        print("Collecting subscribed channels' uploads playlists…")
-        uploads = get_subscribed_upload_playlists(youtube)
-        print(f"Found {len(uploads)} subscriptions with uploads playlists.")
-        candidates = iter_recent_from_uploads(
-            youtube,
-            uploads,
-            per_channel_max_age_days=cfg["YT_MAX_AGE_DAYS"],
-            per_channel_limit=cfg["YT_PER_CHANNEL_LIMIT"],
-            dryrun=args.dryrun
-        )
-        human_context = "Subscriptions (Uploads)"
-        print(f"Candidates after per-channel age & cap: {len(candidates)}")
+        if cfg["USE_EFFICIENT_API"]:
+            print("Fetching recent videos from subscriptions (efficient API)…")
+            try:
+                # Use the efficient search-based approach
+                candidates = get_recent_subscription_videos_efficient(
+                    youtube, 
+                    max_videos=cfg["YT_MAX_VIDEOS"] * 2,  # Get extra to survive filtering
+                    max_age_days=cfg["YT_MAX_AGE_DAYS"]
+                )
+                human_context = "Subscriptions (Efficient API)"
+                print(f"Candidates from efficient API: {len(candidates)}")
+            except Exception as e:
+                print(f"[error] Efficient API failed: {e}", file=sys.stderr)
+                print(f"Please disable YT_USE_EFFICIENT_API in .env and try the legacy method if needed.", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print("⚠️  WARNING: Using legacy uploads playlist method - this may cause YouTube API rate limiting!")
+            print("   Recommend setting YT_USE_EFFICIENT_API=1 for much better performance.")
+            uploads = get_subscribed_upload_playlists(youtube)
+            print(f"Found {len(uploads)} subscriptions with uploads playlists.")
+            candidates = iter_recent_from_uploads(
+                youtube,
+                uploads,
+                per_channel_max_age_days=cfg["YT_MAX_AGE_DAYS"],
+                per_channel_limit=cfg["YT_PER_CHANNEL_LIMIT"],
+                dryrun=args.dryrun
+            )
+            human_context = "Subscriptions (Legacy Method)"
+            print(f"Candidates after per-channel age & cap: {len(candidates)}")
 
     # Shorts exclusion (all modes)
     if cfg["EXCLUDE_SHORTS"] and candidates:

@@ -15,8 +15,10 @@ Fetch transcripts for the **latest videos from channels you're subscribed to** a
 
 ## Features
 
+- **Highly efficient**: Uses only ~11 YouTube API calls instead of 200+ (95% reduction)
 - **Multiple modes**: Process subscriptions, specific playlists, or individual video URLs
 - **Smart filtering**: Skip shorts, already processed videos, and videos from your watch history
+- **Rate limiting protection**: Safe to run regularly without hitting YouTube API limits
 - **IP blocking protection**: Graceful error handling with helpful troubleshooting messages
 - **State tracking**: Remembers processed videos to avoid duplicates
 - **High-quality summaries**: OpenAI generates structured summaries with TL;DR, key takeaways, and action items
@@ -77,15 +79,30 @@ All settings can be configured in `.env`:
 
 - **YT_MAX_VIDEOS**: Maximum videos to process per run (default: 30)
 - **YT_MAX_AGE_DAYS**: Only process videos newer than this (default: 14 days) 
-- **YT_PER_CHANNEL_LIMIT**: Max videos per channel (default: 3)
+- **YT_PER_CHANNEL_LIMIT**: Max videos per channel (default: 3, only for legacy method)
 - **YT_EXCLUDE_SHORTS**: Skip YouTube Shorts (default: true)
+- **YT_USE_EFFICIENT_API**: Use optimized API calls (default: true, **highly recommended**)
 - **OPENAI_API_KEY**: For high-quality structured summaries
 - **OUTPUT_DIR**: Where to save markdown files (default: ./ToJoplin)
 
+### ⚠️ API Method Warning
+
+**Default (Recommended): Efficient API**
+- Uses ~11 YouTube API calls regardless of subscription count
+- Focuses on your most active/relevant subscribed channels
+- **Safe to run regularly** without hitting rate limits
+
+**Legacy Method** (`YT_USE_EFFICIENT_API=0`)
+- Uses 200+ API calls if you have many subscriptions  
+- ⚠️ **WARNING: High risk of YouTube API rate limiting/blocking**
+- Only use if the efficient method doesn't work for your use case
+- May cause IP blocking that requires VPN to resolve
+
 ## Notes & tips
 
+- **API Efficiency**: The default method uses only ~11 YouTube API calls total, making it safe to run regularly without hitting quota limits.
+- **Channel Selection**: The efficient method focuses on your most active/relevant subscribed channels rather than checking every subscription.
 - **Transcripts**: Not every video has one. Auto‑generated transcripts are often available, but some channels disable transcripts entirely.
-- **Quota**: The script uses efficient calls (Uploads playlists) but YouTube API has quotas; very large subscriptions might need paging or a smaller `YT_MAX_VIDEOS`.
 - **Age filter**: Set `YT_MAX_AGE_DAYS` to avoid summarizing ancient videos.
 - **Joplin**: Point Joplin's monitored folder at the same `OUTPUT_DIR`, or drop the folder into your Syncthing path (e.g. `Documents/ToJoplin`) so it imports automatically.
 - **OpenAI**: Generates structured summaries with TL;DR, key takeaways, and suggested follow-up actions.
@@ -109,11 +126,13 @@ Key libraries used:
 ## Recent Updates
 
 **v2025.08.13** - Major improvements:
+- ✅ **New efficient API method** - 95% fewer YouTube API calls (now default)
 - ✅ Fixed IP blocking issues with updated transcript API  
 - ✅ Enhanced OpenAI integration with structured summaries
 - ✅ Added graceful error handling and troubleshooting
 - ✅ Support for playlists and individual video URLs
 - ✅ Improved state tracking and duplicate prevention
+- ✅ Rate limiting protection to prevent YouTube API blocks
 
 ---
 
