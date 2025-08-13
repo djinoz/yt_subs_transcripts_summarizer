@@ -298,16 +298,16 @@ def get_recent_subscription_videos_efficient(youtube, max_videos: int, max_age_d
     """
     Efficiently get recent videos from subscriptions using a hybrid approach:
     1. Get a sample of most relevant subscription channels (~1 API call)
-    2. Use search API to get recent videos from those channels (~10 API calls)
+    2. Use search API to get recent videos from those channels (~8 API calls)
     
-    Total: ~11 API calls instead of 200+ with the old method!
+    Total: ~9 API calls instead of 200+ with the old method!
     """
     # Get a sample of subscribed channels (limit to reduce API calls)
     channels = []
     subs_req = youtube.subscriptions().list(
         part="snippet",
         mine=True,
-        maxResults=20,  # Only get 20 channels to keep API usage low
+        maxResults=8,  # Reduced to 8 channels to stay within daily quota (8 × 100 units × 6 runs = 4800 units/day)
         order="relevance"  # Get most relevant channels
     )
     
