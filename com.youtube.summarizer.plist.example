@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.youtube.summarizer</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/your/project/yt_subs_transcripts_summarizer/run_summarizer.sh</string>
+    </array>
+    
+    <key>WorkingDirectory</key>
+    <string>/path/to/your/project/yt_subs_transcripts_summarizer</string>
+    
+    <key>StartInterval</key>
+    <integer>14400</integer>
+    
+    <key>StandardOutPath</key>
+    <string>/tmp/youtube_summarizer.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/tmp/youtube_summarizer_error.log</string>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>

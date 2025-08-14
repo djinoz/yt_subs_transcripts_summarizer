@@ -1,0 +1,38 @@
+#!/bin/bash
+
+# YouTube Summarizer Runner Script
+# This script ensures the Python environment is properly set up before running
+
+# Change to the script directory - UPDATE THIS PATH
+cd "/path/to/your/project/yt_subs_transcripts_summarizer"
+
+# Log the start time
+echo "$(date): Starting YouTube Summarizer" >> /tmp/youtube_summarizer.log
+
+# Check if python3 is available
+if ! command -v python3 &> /dev/null; then
+    echo "$(date): ERROR - python3 not found" >> /tmp/youtube_summarizer_error.log
+    exit 1
+fi
+
+# Check if required files exist
+if [ ! -f "yt_subs_summarizer.py" ]; then
+    echo "$(date): ERROR - yt_subs_summarizer.py not found" >> /tmp/youtube_summarizer_error.log
+    exit 1
+fi
+
+if [ ! -f ".env" ]; then
+    echo "$(date): ERROR - .env file not found" >> /tmp/youtube_summarizer_error.log
+    exit 1
+fi
+
+# Run the Python script
+python3 yt_subs_summarizer.py
+
+exit_code=$?
+# Log completion with more detail
+if [ $exit_code -eq 0 ]; then
+    echo "$(date): YouTube Summarizer completed successfully" >> /tmp/youtube_summarizer.log
+else
+    echo "$(date): YouTube Summarizer completed with exit code $exit_code" >> /tmp/youtube_summarizer.log
+fi
