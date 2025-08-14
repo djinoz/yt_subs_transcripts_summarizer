@@ -27,6 +27,22 @@ Fetch transcripts for the **latest videos from channels you're subscribed to** a
 - **State tracking**: Remembers processed videos to avoid duplicates
 - **High-quality summaries**: OpenAI generates structured summaries with TL;DR, key takeaways, and action items
 
+## Privacy and Security
+
+### ⚠️ OpenAI Data Privacy
+When you enable OpenAI summaries by setting the `OPENAI_API_KEY`, please be aware that **the full transcript of each video is sent to OpenAI's servers** for processing. While this provides high-quality summaries, you should consider the privacy implications before processing private, unlisted, or sensitive videos.
+
+### Credential Storage
+This script requires access to your Google account and optionally your OpenAI account. This is handled as follows:
+- `client_secret.json`: Your Google OAuth credentials, which you must download.
+- `token.pickle`: Stores the authorization token from Google after you log in. It is created automatically.
+- `.env`: Stores your `OPENAI_API_KEY` and other settings.
+
+These files are sensitive and should **never be shared or committed to version control**. The repository's `.gitignore` file is already configured to exclude them, but you are responsible for keeping them secure.
+
+### A Note on `token.pickle`
+The script uses Python's `pickle` format to save authentication tokens, following the recommended practice from the Google Auth library. While standard for this type of application, be aware that loading a `pickle` file from an untrusted source can be a security risk. Ensure that your local `token.pickle` file is not replaced or tampered with by a malicious actor.
+
 ## Quick start
 
 1. **Create a Google Cloud project** → enable **YouTube Data API v3**.
