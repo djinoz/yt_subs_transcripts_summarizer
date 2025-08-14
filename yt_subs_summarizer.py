@@ -79,6 +79,11 @@ except Exception:
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
 
+def log_message(message: str, file=sys.stdout):
+    """Prints a message to the specified file stream with a timestamp."""
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}", file=file)
+
 # ------------------ Config & State ------------------
 
 def load_config():
@@ -146,7 +151,7 @@ def load_takeout_history_ids(path: str) -> Set[str]:
             if vid:
                 ids.add(vid)
     except Exception as e:
-        print(f"[warn] Could not parse Takeout watch history at {path}: {e}", file=sys.stderr)
+        log_message(f"[warn] Could not parse Takeout watch history at {path}: {e}", file=sys.stderr)
     return ids
 
 # ------------------ API helpers ------------------
@@ -165,7 +170,7 @@ def get_youtube_service() -> object:
                 creds = None
         if not creds:
             if not os.path.exists("client_secret.json"):
-                print("ERROR: Put your OAuth 'client_secret.json' in this folder.", file=sys.stderr)
+                log_message("ERROR: Put your OAuth 'client_secret.json' in this folder.", file=sys.stderr)
                 sys.exit(1)
             flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
             creds = flow.run_local_server(port=0)
@@ -196,7 +201,7 @@ def _execute_with_backoff(request, what: str, max_attempts: int = 5):
     
     # If quota is already exhausted, don't make any more API calls
     if QUOTA_EXHAUSTED:
-        print(f"[skip] {what}: Quota exhausted, abandoning API calls", file=sys.stderr)
+        log_message(f"[skip] {what}: Quota exhausted, abandoning API calls", file=sys.stderr)
         return None
     
     delay = 1.0
@@ -209,7 +214,7 @@ def _execute_with_backoff(request, what: str, max_attempts: int = 5):
             # Check for quota exhaustion
             if status == 403 and reason == "quotaExceeded":
                 QUOTA_EXHAUSTED = True
-                print(f"[QUOTA] {what}: YouTube API quota exhausted. Abandoning further API calls but will process any videos already retrieved.", file=sys.stderr)
+                log_message(f"[QUOTA] {what}: YouTube API quota exhausted. Abandoning further API calls but will process any videos already retrieved.", file=sys.stderr)
                 return None
                 
             if status in (403, 404) and (reason in (
@@ -220,19 +225,19 @@ def _execute_with_backoff(request, what: str, max_attempts: int = 5):
                 "channelSuspended",
                 "channelDisabled",
             ) or what.startswith("playlistItems.list:")):
-                print(f"[skip] {what}: {status} {reason}", file=sys.stderr)
+                log_message(f"[skip] {what}: {status} {reason}", file=sys.stderr)
                 return None
             if not _should_retry(status, reason):
-                print(f"[fail] {what}: HTTP {status} ({reason})", file=sys.stderr)
+                log_message(f"[fail] {what}: HTTP {status} ({reason})", file=sys.stderr)
                 raise
-            print(f"[retry] {what}: HTTP {status} ({reason}), attempt {attempt}/{max_attempts}, sleep {delay:.1f}s", file=sys.stderr)
+            log_message(f"[retry] {what}: HTTP {status} ({reason}), attempt {attempt}/{max_attempts}, sleep {delay:.1f}s", file=sys.stderr)
             import time as _t; _t.sleep(delay)
             delay = min(delay * 2, 30.0)
         except Exception as e:
             if attempt >= 3:
-                print(f"[fail] {what}: {e}", file=sys.stderr)
+                log_message(f"[fail] {what}: {e}", file=sys.stderr)
                 raise
-            print(f"[retry] {what}: {e}, attempt {attempt}/3, sleep {delay:.1f}s", file=sys.stderr)
+            log_message(f"[retry] {what}: {e}, attempt {attempt}/3, sleep {delay:.1f}s", file=sys.stderr)
             import time as _t; _t.sleep(delay)
             delay = min(delay * 2, 30.0)
     return None
@@ -307,7 +312,7 @@ def exclude_shorts(youtube, videos: List[Dict], max_seconds: int) -> List[Dict]:
             if secs > max_seconds:
                 kept.append(v)
             else:
-                print(f"[skip] SHORT ({secs}s) {v['channelTitle']} — {v['title']}", file=sys.stderr)
+                log_message(f"[skip] SHORT ({secs}s) {v['channelTitle']} — {v['title']}", file=sys.stderr)
     return kept
 
 # ------------------ Efficient Subscription API ------------------
@@ -341,7 +346,7 @@ def get_recent_subscription_videos_efficient(youtube, max_videos: int, max_age_d
         except KeyError:
             continue
     
-    print(f"Searching recent videos from {len(channels)} most active subscribed channels…")
+    log_message(f"Searching recent videos from {len(channels)} most active subscribed channels…")
     
     # Now use search API to get recent videos from these channels
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max_age_days) if max_age_days > 0 else None
@@ -417,7 +422,7 @@ def iter_recent_from_uploads(youtube, uploads_info: List[Dict], per_channel_max_
             except Exception:
                 continue
         if dryrun and got == 0:
-            print(f"[info] No recent items for channel: {channel_title}")
+            log_message(f"[info] No recent items for channel: {channel_title}")
     return videos
 
 def list_videos_from_playlist_id(youtube, playlist_id: str, max_age_days: int) -> Tuple[List[Dict], str]:
@@ -487,9 +492,9 @@ def resolve_playlist_id(youtube, query: str) -> Optional[Tuple[str, str]]:
             if pid:
                 candidates.append((title, pid))
         if candidates:
-            print("[error] No exact playlist title match. Did you mean one of:", file=sys.stderr)
+            log_message("[error] No exact playlist title match. Did you mean one of:", file=sys.stderr)
             for t, pid in candidates:
-                print(f"  - {t} (id: {pid})", file=sys.stderr)
+                log_message(f"  - {t} (id: {pid})", file=sys.stderr)
     return None
 
 # ------------------ Transcript helpers ------------------
@@ -500,14 +505,14 @@ def _list_transcripts_debug(video_id: str, cookies_path: Optional[str], proxies:
         listing = api.list(video_id)
         return str(listing)
     except IpBlocked as e:
-        print(f"\n❌ ERROR: YouTube is blocking requests from your IP address.", file=sys.stderr)
-        print(f"This usually happens when:", file=sys.stderr)
-        print(f"- You've made too many requests and your IP has been temporarily blocked", file=sys.stderr)
-        print(f"- Your IP belongs to a cloud provider (AWS, Google Cloud, Azure, etc.)", file=sys.stderr)
-        print(f"\n💡 Solutions:", file=sys.stderr)
-        print(f"- Connect to a VPN and try again", file=sys.stderr)
-        print(f"- Wait a few hours before trying again", file=sys.stderr)
-        print(f"- Use a residential IP address instead of cloud/datacenter IP", file=sys.stderr)
+        log_message(f"\n❌ ERROR: YouTube is blocking requests from your IP address.", file=sys.stderr)
+        log_message(f"This usually happens when:", file=sys.stderr)
+        log_message(f"- You've made too many requests and your IP has been temporarily blocked", file=sys.stderr)
+        log_message(f"- Your IP belongs to a cloud provider (AWS, Google Cloud, Azure, etc.)", file=sys.stderr)
+        log_message(f"\n💡 Solutions:", file=sys.stderr)
+        log_message(f"- Connect to a VPN and try again", file=sys.stderr)
+        log_message(f"- Wait a few hours before trying again", file=sys.stderr)
+        log_message(f"- Use a residential IP address instead of cloud/datacenter IP", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         return f"(unable to list transcripts: {type(e).__name__}: {e})"
@@ -621,14 +626,14 @@ def fetch_transcript_any_lang(
         if text:
             return {"text": text, "lang": fetched_transcript.language_code, "translated": False}
     except IpBlocked as e:
-        print(f"\n❌ ERROR: YouTube is blocking requests from your IP address.", file=sys.stderr)
-        print(f"This usually happens when:", file=sys.stderr)
-        print(f"- You've made too many requests and your IP has been temporarily blocked", file=sys.stderr)
-        print(f"- Your IP belongs to a cloud provider (AWS, Google Cloud, Azure, etc.)", file=sys.stderr)
-        print(f"\n💡 Solutions:", file=sys.stderr)
-        print(f"- Connect to a VPN and try again", file=sys.stderr)
-        print(f"- Wait a few hours before trying again", file=sys.stderr)
-        print(f"- Use a residential IP address instead of cloud/datacenter IP", file=sys.stderr)
+        log_message(f"\n❌ ERROR: YouTube is blocking requests from your IP address.", file=sys.stderr)
+        log_message(f"This usually happens when:", file=sys.stderr)
+        log_message(f"- You've made too many requests and your IP has been temporarily blocked", file=sys.stderr)
+        log_message(f"- Your IP belongs to a cloud provider (AWS, Google Cloud, Azure, etc.)", file=sys.stderr)
+        log_message(f"\n💡 Solutions:", file=sys.stderr)
+        log_message(f"- Connect to a VPN and try again", file=sys.stderr)
+        log_message(f"- Wait a few hours before trying again", file=sys.stderr)
+        log_message(f"- Use a residential IP address instead of cloud/datacenter IP", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         reasons.append(f"A:fetch_preferred:{type(e).__name__}")
@@ -642,18 +647,18 @@ def fetch_transcript_any_lang(
             return {"text": text, "lang": fetched_transcript.language_code, "translated": False}
             
     except IpBlocked as e:
-        print(f"\n❌ ERROR: YouTube is blocking requests from your IP address.", file=sys.stderr)
-        print(f"This usually happens when:", file=sys.stderr)
-        print(f"- You've made too many requests and your IP has been temporarily blocked", file=sys.stderr)
-        print(f"- Your IP belongs to a cloud provider (AWS, Google Cloud, Azure, etc.)", file=sys.stderr)
-        print(f"\n💡 Solutions:", file=sys.stderr)
-        print(f"- Connect to a VPN and try again", file=sys.stderr)
-        print(f"- Wait a few hours before trying again", file=sys.stderr)
-        print(f"- Use a residential IP address instead of cloud/datacenter IP", file=sys.stderr)
+        log_message(f"\n❌ ERROR: YouTube is blocking requests from your IP address.", file=sys.stderr)
+        log_message(f"This usually happens when:", file=sys.stderr)
+        log_message(f"- You've made too many requests and your IP has been temporarily blocked", file=sys.stderr)
+        log_message(f"- Your IP belongs to a cloud provider (AWS, Google Cloud, Azure, etc.)", file=sys.stderr)
+        log_message(f"\n💡 Solutions:", file=sys.stderr)
+        log_message(f"- Connect to a VPN and try again", file=sys.stderr)
+        log_message(f"- Wait a few hours before trying again", file=sys.stderr)
+        log_message(f"- Use a residential IP address instead of cloud/datacenter IP", file=sys.stderr)
         sys.exit(1)
     except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript) as e:
         if log_skips:
-            print(f"[skip] {video_id} no transcripts: {type(e).__name__}", file=sys.stderr)
+            log_message(f"[skip] {video_id} no transcripts: {type(e).__name__}", file=sys.stderr)
         return None
     except Exception as e:
         reasons.append(f"B:fetch_any:{type(e).__name__}")
@@ -661,14 +666,14 @@ def fetch_transcript_any_lang(
     # --- C) yt-dlp fallback
     ytdlp_result = _fetch_transcript_via_ytdlp(video_id, cookies_path, proxies)
     if ytdlp_result:
-        print(f"[fallback] {video_id} transcript fetched via yt-dlp", file=sys.stderr)
+        log_message(f"[fallback] {video_id} transcript fetched via yt-dlp", file=sys.stderr)
         return ytdlp_result
 
     if log_skips:
         if reasons:
-            print(f"[skip] {video_id} transcripts exist but were not retrievable. Reasons: {', '.join(reasons)}", file=sys.stderr)
+            log_message(f"[skip] {video_id} transcripts exist but were not retrievable. Reasons: {', '.join(reasons)}", file=sys.stderr)
         else:
-            print(f"[skip] {video_id} transcripts exist but none usable with current policy", file=sys.stderr)
+            log_message(f"[skip] {video_id} transcripts exist but none usable with current policy", file=sys.stderr)
     return None
 
 # ------------------ Summaries ------------------
@@ -766,9 +771,9 @@ def main():
     processed_ids = load_state(state_file)
     takeout_ids = load_takeout_history_ids(cfg["TAKEOUT_WATCH_HISTORY_JSON"])
     if takeout_ids:
-        print(f"Loaded {len(takeout_ids)} watched IDs from Takeout.")
+        log_message(f"Loaded {len(takeout_ids)} watched IDs from Takeout.")
 
-    print("Authorizing with YouTube…")
+    log_message("Authorizing with YouTube…")
     youtube = get_youtube_service()
 
     candidates: List[Dict] = []
@@ -778,26 +783,26 @@ def main():
         query = args.playlist.strip()
         resolved = resolve_playlist_id(youtube, query)
         if not resolved:
-            print(f"[error] Playlist not found for: {query}", file=sys.stderr)
+            log_message(f"[error] Playlist not found for: {query}", file=sys.stderr)
             sys.exit(2)
         pid, pl_title = resolved
         human_context = f'Playlist: "{pl_title}"'
-        print(f'Using playlist: {pl_title}')
+        log_message(f'Using playlist: {pl_title}')
         videos, _title = list_videos_from_playlist_id(youtube, pid, cfg["YT_MAX_AGE_DAYS"])
         candidates = videos
-        print(f"Candidates from playlist after age filter: {len(candidates)}")
+        log_message(f"Candidates from playlist after age filter: {len(candidates)}")
 
     elif args.urls is not None:
         if len(args.urls) == 0:
-            print("[error] --urls provided but no URLs/IDs given.", file=sys.stderr)
+            log_message("[error] --urls provided but no URLs/IDs given.", file=sys.stderr)
             sys.exit(2)
         vids, bad = [], []
         for u in args.urls:
             vid = _extract_video_id(u)
             (vids if vid else bad).append(vid or u)
         if not vids:
-            print("[error] No valid video URLs/IDs parsed from --urls.", file=sys.stderr)
-            if bad: print("  Invalid:", ", ".join(bad), file=sys.stderr)
+            log_message("[error] No valid video URLs/IDs parsed from --urls.", file=sys.stderr)
+            if bad: log_message("  Invalid:", ", ".join(bad), file=sys.stderr)
             sys.exit(2)
         for i in range(0, len(vids), 50):
             chunk = vids[i:i+50]
@@ -819,7 +824,7 @@ def main():
 
     else:
         if cfg["USE_EFFICIENT_API"]:
-            print("Fetching recent videos from subscriptions (efficient API)…")
+            log_message("Fetching recent videos from subscriptions (efficient API)…")
             try:
                 # Use the efficient search-based approach
                 candidates = get_recent_subscription_videos_efficient(
@@ -828,27 +833,27 @@ def main():
                     max_age_days=cfg["YT_MAX_AGE_DAYS"]
                 )
                 human_context = "Subscriptions (Efficient API)"
-                print(f"Candidates from efficient API: {len(candidates)}")
+                log_message(f"Candidates from efficient API: {len(candidates)}")
                 
                 # Check if quota was exhausted during retrieval
                 if QUOTA_EXHAUSTED:
-                    print(f"⚠️  API quota exhausted during video retrieval. Will process {len(candidates)} videos that were retrieved before quota limit.")
+                    log_message(f"⚠️  API quota exhausted during video retrieval. Will process {len(candidates)} videos that were retrieved before quota limit.")
                     
             except Exception as e:
-                print(f"[error] Efficient API failed: {e}", file=sys.stderr)
+                log_message(f"[error] Efficient API failed: {e}", file=sys.stderr)
                 # If quota exhausted, don't exit - we might have some candidates to process
                 if not QUOTA_EXHAUSTED:
-                    print(f"Please disable YT_USE_EFFICIENT_API in .env and try the legacy method if needed.", file=sys.stderr)
+                    log_message(f"Please disable YT_USE_EFFICIENT_API in .env and try the legacy method if needed.", file=sys.stderr)
                     sys.exit(1)
                 else:
-                    print("Quota exhausted - will process any videos retrieved before the limit.", file=sys.stderr)
+                    log_message("Quota exhausted - will process any videos retrieved before the limit.", file=sys.stderr)
                     candidates = []  # No candidates if we failed due to quota
         else:
-            print("⚠️  WARNING: Using legacy uploads playlist method - this may cause YouTube API rate limiting!")
-            print("   Recommend setting YT_USE_EFFICIENT_API=1 for much better performance.")
+            log_message("⚠️  WARNING: Using legacy uploads playlist method - this may cause YouTube API rate limiting!")
+            log_message("   Recommend setting YT_USE_EFFICIENT_API=1 for much better performance.")
             try:
                 uploads = get_subscribed_upload_playlists(youtube)
-                print(f"Found {len(uploads)} subscriptions with uploads playlists.")
+                log_message(f"Found {len(uploads)} subscriptions with uploads playlists.")
                 candidates = iter_recent_from_uploads(
                     youtube,
                     uploads,
@@ -857,16 +862,16 @@ def main():
                     dryrun=args.dryrun
                 )
                 human_context = "Subscriptions (Legacy Method)"
-                print(f"Candidates after per-channel age & cap: {len(candidates)}")
+                log_message(f"Candidates after per-channel age & cap: {len(candidates)}")
                 
                 # Check if quota was exhausted during retrieval
                 if QUOTA_EXHAUSTED:
-                    print(f"⚠️  API quota exhausted during video retrieval. Will process {len(candidates)} videos that were retrieved before quota limit.")
+                    log_message(f"⚠️  API quota exhausted during video retrieval. Will process {len(candidates)} videos that were retrieved before quota limit.")
                     
             except Exception as e:
-                print(f"[error] Legacy API failed: {e}", file=sys.stderr)
+                log_message(f"[error] Legacy API failed: {e}", file=sys.stderr)
                 if QUOTA_EXHAUSTED:
-                    print("Quota exhausted - will process any videos retrieved before the limit.", file=sys.stderr)
+                    log_message("Quota exhausted - will process any videos retrieved before the limit.", file=sys.stderr)
                     candidates = []  # No candidates if we failed due to quota
                 else:
                     raise
@@ -875,9 +880,9 @@ def main():
     if cfg["EXCLUDE_SHORTS"] and candidates and not QUOTA_EXHAUSTED:
         before = len(candidates)
         candidates = exclude_shorts(youtube, candidates, cfg["SHORTS_MAX_SECONDS"])
-        print(f"After Shorts filter: kept {len(candidates)}/{before}")
+        log_message(f"After Shorts filter: kept {len(candidates)}/{before}")
     elif cfg["EXCLUDE_SHORTS"] and candidates and QUOTA_EXHAUSTED:
-        print(f"Skipping Shorts filter due to quota exhaustion. Processing {len(candidates)} videos as-is.")
+        log_message(f"Skipping Shorts filter due to quota exhaustion. Processing {len(candidates)} videos as-is.")
 
     # Unwatched proxy: remove already processed & (optionally) watched via Takeout
     before = len(candidates)
@@ -886,38 +891,38 @@ def main():
         vid = v["videoId"]
         if vid in processed_ids:
             if cfg["LOG_SKIPS"]:
-                print(f"[skip] already processed: {v['channelTitle']} — {v['title']}", file=sys.stderr)
+                log_message(f"[skip] already processed: {v['channelTitle']} — {v['title']}", file=sys.stderr)
             continue
         if takeout_ids and vid in takeout_ids:
             if cfg["LOG_SKIPS"]:
-                print(f"[skip] in watch history: {v['channelTitle']} — {v['title']}", file=sys.stderr)
+                log_message(f"[skip] in watch history: {v['channelTitle']} — {v['title']}", file=sys.stderr)
             continue
         filtered.append(v)
     candidates = filtered
-    print(f"After unwatched proxy filter: kept {len(candidates)}/{before}")
+    log_message(f"After unwatched proxy filter: kept {len(candidates)}/{before}")
 
     # Sort newest-first & apply global cap (not for --urls)
     candidates.sort(key=lambda x: x.get("publishedAt",""), reverse=True)
     if cfg["YT_MAX_VIDEOS"] > 0 and args.urls is None:
         candidates = candidates[:cfg["YT_MAX_VIDEOS"]]
     cap_info = cfg['YT_MAX_VIDEOS'] if args.urls is None else 'n/a (--urls)'
-    print(f"Final selection count: {len(candidates)} (cap={cap_info})")
+    log_message(f"Final selection count: {len(candidates)} (cap={cap_info})")
 
     if not candidates:
-        print("No videos to process after filters.")
+        log_message("No videos to process after filters.")
         if not args.dryrun and not args.skip_state:
             save_state(state_file, processed_ids)
         return
 
     if args.dryrun:
-        print(f"---- DRY RUN LIST ({human_context}) ----")
+        log_message(f"---- DRY RUN LIST ({human_context}) ----")
         for v in candidates:
             vid = v["videoId"]
             url = f"https://www.youtube.com/watch?v={vid}"
-            print(f"- {v['channelTitle']} | {v['title']} | {url}")
+            log_message(f"- {v['channelTitle']} | {v['title']} | {url}")
             if args.show_transcripts:
                 info_line = _list_transcripts_debug(vid, cfg["COOKIES_FILE"], proxies)
-                print(f"  captions available: {info_line}")
+                log_message(f"  captions available: {info_line}")
             info = fetch_transcript_any_lang(
                 vid,
                 pref_langs=cfg["PREF_LANGS"],
@@ -928,11 +933,11 @@ def main():
                 proxies=proxies,
             )
             snippet = ("not found" if not info else (info["text"][:100].replace("\n", " ") + ("…" if len(info["text"])>100 else "")))
-            print(f"  transcript: {snippet}")
-        print("---- END DRY RUN ----")
+            log_message(f"  transcript: {snippet}")
+        log_message("---- END DRY RUN ----")
         return
 
-    print(f"Processing {len(candidates)} videos…")
+    log_message(f"Processing {len(candidates)} videos…")
     saved = 0
     for v in tqdm(candidates, desc="Summarizing"):
         vid = v["videoId"]
@@ -968,19 +973,19 @@ def main():
             if not args.skip_state:
                 processed_ids.add(vid)
         except Exception as e:
-            print(f"[warn] failed to save/mark {vid}: {e}", file=sys.stderr)
+            log_message(f"[warn] failed to save/mark {vid}: {e}", file=sys.stderr)
 
     if not args.skip_state:
         save_state(state_file, processed_ids)
     
     # Final summary message
     if QUOTA_EXHAUSTED:
-        print(f"✓ Completed processing despite YouTube API quota exhaustion.")
-        print(f"  Processed {saved} videos that were retrieved before quota limit.")
-        print(f"  Markdown files saved to: {out_dir.resolve()}")
-        print(f"  Script will retry remaining videos on next scheduled run (quota resets daily).")
+        log_message(f"✓ Completed processing despite YouTube API quota exhaustion.")
+        log_message(f"  Processed {saved} videos that were retrieved before quota limit.")
+        log_message(f"  Markdown files saved to: {out_dir.resolve()}")
+        log_message(f"  Script will retry remaining videos on next scheduled run (quota resets daily).")
     else:
-        print(f"Done. Markdown files saved to: {out_dir.resolve()} (wrote {saved} files)")
+        log_message(f"Done. Markdown files saved to: {out_dir.resolve()} (wrote {saved} files)")
 
 if __name__ == "__main__":
     main()
