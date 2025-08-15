@@ -321,16 +321,17 @@ def get_recent_subscription_videos_efficient(youtube, max_videos: int, max_age_d
     """
     Efficiently get recent videos from subscriptions using a hybrid approach:
     1. Get a sample of most relevant subscription channels (~1 API call)
-    2. Use search API to get recent videos from those channels (~8 API calls)
+    2. Use search API to get recent videos from those channels (~20 API calls)
     
-    Total: ~9 API calls instead of 200+ with the old method!
+    Total: ~21 API calls instead of 200+ with the old method!
+    Retrieves extra videos to account for heavy filtering (Shorts, already processed, etc.)
     """
-    # Get a sample of subscribed channels (limit to reduce API calls)
+    # Get a sample of subscribed channels (increased to get more candidates for filtering)
     channels = []
     subs_req = youtube.subscriptions().list(
         part="snippet",
         mine=True,
-        maxResults=8,  # Reduced to 8 channels to stay within daily quota (8 × 100 units × 6 runs = 4800 units/day)
+        maxResults=20,  # Increased from 8 to get more channels and survive filtering
         order="relevance"  # Get most relevant channels
     )
     
@@ -352,7 +353,7 @@ def get_recent_subscription_videos_efficient(youtube, max_videos: int, max_age_d
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max_age_days) if max_age_days > 0 else None
     videos = []
     
-    for channel in channels[:10]:  # Limit to 10 channels to keep API usage reasonable
+    for channel in channels[:20]:  # Increased from 10 to process more channels
         if len(videos) >= max_videos:
             break
             
@@ -361,7 +362,7 @@ def get_recent_subscription_videos_efficient(youtube, max_videos: int, max_age_d
             channelId=channel["id"],
             type="video",
             order="date",
-            maxResults=min(5, max_videos // 10 + 1),  # Get a few recent videos per channel
+            maxResults=min(15, max_videos // 15 + 5),  # Increased from 5 to get more videos per channel
             publishedAfter=(cutoff.isoformat() if cutoff else None)
         )
         
@@ -829,7 +830,7 @@ def main():
                 # Use the efficient search-based approach
                 candidates = get_recent_subscription_videos_efficient(
                     youtube, 
-                    max_videos=cfg["YT_MAX_VIDEOS"] * 2,  # Get extra to survive filtering
+                    max_videos=cfg["YT_MAX_VIDEOS"] * 10,  # Get 10x to survive heavy filtering (Shorts + already processed)
                     max_age_days=cfg["YT_MAX_AGE_DAYS"]
                 )
                 human_context = "Subscriptions (Efficient API)"
