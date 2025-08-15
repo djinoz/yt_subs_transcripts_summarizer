@@ -86,7 +86,7 @@ def log_message(message: str, file=sys.stdout):
 
 # ------------------ Config & State ------------------
 
-def load_config():
+def load_config(args=None):
     load_dotenv()
     cfg = {
         "YT_MAX_VIDEOS": int(os.getenv("YT_MAX_VIDEOS", "30")),
@@ -110,6 +110,16 @@ def load_config():
         "HTTPS_PROXY": os.getenv("HTTPS_PROXY", "").strip() or None,
         "USE_EFFICIENT_API": os.getenv("YT_USE_EFFICIENT_API", "1").strip() not in ("0", "false", "False"),
     }
+    
+    # Apply command-line overrides if provided
+    if args:
+        if args.max_age_days is not None:
+            cfg["YT_MAX_AGE_DAYS"] = args.max_age_days
+        if args.max_videos is not None:
+            cfg["YT_MAX_VIDEOS"] = args.max_videos
+        if getattr(args, 'per_channel_limit', None) is not None:
+            cfg["YT_PER_CHANNEL_LIMIT"] = args.per_channel_limit
+    
     return cfg
 
 def load_state(path: str) -> Set[str]:
@@ -754,9 +764,12 @@ def main():
     ap.add_argument("--dryrun", action="store_true", help="Print human-readable info; no files/state.")
     ap.add_argument("--show-transcripts", action="store_true", help="With --dryrun, list available caption langs/types per video.")
     ap.add_argument("--skip-state", action="store_true", help="Do not update the state file (still read for filtering).")
+    ap.add_argument("--max-age-days", type=int, help="Override YT_MAX_AGE_DAYS from .env file.")
+    ap.add_argument("--max-videos", type=int, help="Override YT_MAX_VIDEOS from .env file.")
+    ap.add_argument("--per-channel-limit", type=int, help="Override YT_PER_CHANNEL_LIMIT from .env file.")
     args = ap.parse_args()
 
-    cfg = load_config()
+    cfg = load_config(args)
     out_dir = pathlib.Path(cfg["OUTPUT_DIR"])
     use_openai = bool(cfg["OPENAI_API_KEY"])
 
