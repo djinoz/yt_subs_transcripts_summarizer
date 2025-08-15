@@ -390,6 +390,7 @@ def get_recent_subscription_videos_efficient(youtube, max_videos: int, max_age_d
                     "publishedAt": item["snippet"]["publishedAt"],
                     "title": item["snippet"]["title"],
                     "channelTitle": item["snippet"]["channelTitle"],
+                    "videoOwnerChannelTitle": item["snippet"]["channelTitle"],  # Same as channelTitle for subscription videos
                 })
             except KeyError:
                 continue
@@ -426,6 +427,7 @@ def iter_recent_from_uploads(youtube, uploads_info: List[Dict], per_channel_max_
                     "publishedAt": item["contentDetails"]["videoPublishedAt"],
                     "title": item["snippet"]["title"],
                     "channelTitle": channel_title,
+                    "videoOwnerChannelTitle": channel_title,  # Same as channelTitle for subscription videos
                 })
                 got += 1
                 if got >= per_channel_limit:
@@ -461,6 +463,7 @@ def list_videos_from_playlist_id(youtube, playlist_id: str, max_age_days: int) -
                     "publishedAt": item["contentDetails"]["videoPublishedAt"],
                     "title": item["snippet"]["title"],
                     "channelTitle": item["snippet"]["channelTitle"],
+                    "videoOwnerChannelTitle": item["snippet"].get("videoOwnerChannelTitle", item["snippet"]["channelTitle"]),
                 })
             except Exception:
                 continue
@@ -728,9 +731,13 @@ def save_markdown(out_dir: pathlib.Path, video: Dict, transcript_info: Dict[str,
     url = f"https://www.youtube.com/watch?v={video['videoId']}"
     lang = transcript_info.get("lang", "unknown")
     translated = transcript_info.get("translated", False)
+    
+    # Use video owner channel title if different from channel title (for playlists)
+    display_channel = video.get("videoOwnerChannelTitle", video["channelTitle"])
+    
     # YAML moved to bottom - decode HTML entities for clean display
     md = f"""# {clean_title}
-**Channel:** {html.unescape(video['channelTitle'])}  
+**Channel:** {html.unescape(display_channel)}  
 **Published:** {video['publishedAt']}  
 **Link:** {url}
 
@@ -739,7 +746,7 @@ def save_markdown(out_dir: pathlib.Path, video: Dict, transcript_info: Dict[str,
 
 ---
 title: "{clean_title}"
-channel: "{html.unescape(video['channelTitle'])}"
+channel: "{html.unescape(display_channel)}"
 video_id: "{video['videoId']}"
 published_at: "{video['publishedAt']}"
 source_url: "{url}"
@@ -831,6 +838,7 @@ def main():
                         "publishedAt": it["snippet"]["publishedAt"],
                         "title": it["snippet"]["title"],
                         "channelTitle": it["snippet"]["channelTitle"],
+                        "videoOwnerChannelTitle": it["snippet"]["channelTitle"],  # Same as channelTitle for individual videos
                     })
                 except Exception:
                     continue
