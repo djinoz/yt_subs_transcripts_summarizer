@@ -122,16 +122,25 @@ def load_config(args=None):
     
     return cfg
 
-def load_state(path: str) -> Set[str]:
+def load_state(path: str) -> Tuple[Set[str], Dict[str, str]]:
+    """Load state returning (processed_ids, video_errors)"""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return set(data.get("processed_video_ids", []))
+        processed_ids = set(data.get("processed_video_ids", []))
+        video_errors = data.get("video_errors", {})
+        return processed_ids, video_errors
     except Exception:
-        return set()
+        return set(), {}
 
-def save_state(path: str, processed_ids: Set[str]):
-    tmp = {"processed_video_ids": sorted(processed_ids)}
+def save_state(path: str, processed_ids: Set[str], video_errors: Dict[str, str] = None):
+    """Save state with processed IDs and error information"""
+    if video_errors is None:
+        video_errors = {}
+    tmp = {
+        "processed_video_ids": sorted(processed_ids),
+        "video_errors": video_errors
+    }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(tmp, f, indent=2)
 
@@ -671,9 +680,8 @@ def fetch_transcript_any_lang(
         log_message(f"- Use a residential IP address instead of cloud/datacenter IP", file=sys.stderr)
         sys.exit(1)
     except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript) as e:
-        if log_skips:
-            log_message(f"[skip] {video_id} no transcripts: {type(e).__name__}", file=sys.stderr)
-        return None
+        # Re-raise these errors so they can be caught and stored in the main loop
+        raise
     except Exception as e:
         reasons.append(f"B:fetch_any:{type(e).__name__}")
 
@@ -789,7 +797,7 @@ def main():
 
     # State & optional watch-history
     state_file = cfg["STATE_FILE"]
-    processed_ids = load_state(state_file)
+    processed_ids, video_errors = load_state(state_file)
     takeout_ids = load_takeout_history_ids(cfg["TAKEOUT_WATCH_HISTORY_JSON"])
     if takeout_ids:
         log_message(f"Loaded {len(takeout_ids)} watched IDs from Takeout.")
@@ -906,7 +914,7 @@ def main():
     elif cfg["EXCLUDE_SHORTS"] and candidates and QUOTA_EXHAUSTED:
         log_message(f"Skipping Shorts filter due to quota exhaustion. Processing {len(candidates)} videos as-is.")
 
-    # Unwatched proxy: remove already processed & (optionally) watched via Takeout
+    # Unwatched proxy: remove already processed, errored videos & (optionally) watched via Takeout
     before = len(candidates)
     filtered = []
     for v in candidates:
@@ -914,6 +922,10 @@ def main():
         if vid in processed_ids:
             if cfg["LOG_SKIPS"]:
                 log_message(f"[skip] already processed: {v['channelTitle']} — {v['title']}", file=sys.stderr)
+            continue
+        if vid in video_errors:
+            if cfg["LOG_SKIPS"]:
+                log_message(f"[skip] previous error ({video_errors[vid]}): {v['channelTitle']} — {v['title']}", file=sys.stderr)
             continue
         if takeout_ids and vid in takeout_ids:
             if cfg["LOG_SKIPS"]:
@@ -933,7 +945,7 @@ def main():
     if not candidates:
         log_message("No videos to process after filters.")
         if not args.dryrun and not args.skip_state:
-            save_state(state_file, processed_ids)
+            save_state(state_file, processed_ids, video_errors)
         return
 
     if args.dryrun:
@@ -945,6 +957,28 @@ def main():
             if args.show_transcripts:
                 info_line = _list_transcripts_debug(vid, cfg["COOKIES_FILE"], proxies)
                 log_message(f"  captions available: {info_line}")
+            try:
+                info = fetch_transcript_any_lang(
+                    vid,
+                    pref_langs=cfg["PREF_LANGS"],
+                    translate_to=cfg["TRANSLATE_TO"],
+                    accept_non_en=cfg["ACCEPT_NON_EN"],
+                    log_skips=cfg["LOG_SKIPS"],
+                    cookies_path=cfg["COOKIES_FILE"],
+                    proxies=proxies,
+                )
+                snippet = ("not found" if not info else (info["text"][:100].replace("\n", " ") + ("…" if len(info["text"])>100 else "")))
+            except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript) as e:
+                snippet = f"error: {type(e).__name__}"
+            log_message(f"  transcript: {snippet}")
+        log_message("---- END DRY RUN ----")
+        return
+
+    log_message(f"Processing {len(candidates)} videos…")
+    saved = 0
+    for v in tqdm(candidates, desc="Summarizing"):
+        vid = v["videoId"]
+        try:
             info = fetch_transcript_any_lang(
                 vid,
                 pref_langs=cfg["PREF_LANGS"],
@@ -954,24 +988,14 @@ def main():
                 cookies_path=cfg["COOKIES_FILE"],
                 proxies=proxies,
             )
-            snippet = ("not found" if not info else (info["text"][:100].replace("\n", " ") + ("…" if len(info["text"])>100 else "")))
-            log_message(f"  transcript: {snippet}")
-        log_message("---- END DRY RUN ----")
-        return
-
-    log_message(f"Processing {len(candidates)} videos…")
-    saved = 0
-    for v in tqdm(candidates, desc="Summarizing"):
-        vid = v["videoId"]
-        info = fetch_transcript_any_lang(
-            vid,
-            pref_langs=cfg["PREF_LANGS"],
-            translate_to=cfg["TRANSLATE_TO"],
-            accept_non_en=cfg["ACCEPT_NON_EN"],
-            log_skips=cfg["LOG_SKIPS"],
-            cookies_path=cfg["COOKIES_FILE"],
-            proxies=proxies,
-        )
+        except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript) as e:
+            # Store the error type for this video to avoid retrying
+            error_type = type(e).__name__
+            video_errors[vid] = error_type
+            if cfg["LOG_SKIPS"]:
+                log_message(f"[skip] {vid} transcript error recorded: {error_type}", file=sys.stderr)
+            continue
+        
         if not info:
             if cfg["MARK_PROCESSED_ON_NO_TRANSCRIPT"] and not args.skip_state:
                 processed_ids.add(vid)
@@ -998,7 +1022,7 @@ def main():
             log_message(f"[warn] failed to save/mark {vid}: {e}", file=sys.stderr)
 
     if not args.skip_state:
-        save_state(state_file, processed_ids)
+        save_state(state_file, processed_ids, video_errors)
     
     # Final summary message
     if QUOTA_EXHAUSTED:
