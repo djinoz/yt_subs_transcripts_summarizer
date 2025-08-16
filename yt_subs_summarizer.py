@@ -25,6 +25,7 @@
 #   YT_TRANSLATE_TO=en
 #   YT_ACCEPT_NON_EN=1
 #   YT_MARK_PROCESSED_ON_NO_TRANSCRIPT=0
+#   YT_LOG_LEVEL=ERROR                  # ERROR, WARN, INFO (default ERROR)
 #   OPENAI_API_KEY= (optional)
 #   OPENAI_MODEL=gpt-4o-mini
 
@@ -84,6 +85,11 @@ def log_message(message: str, file=sys.stdout):
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}", file=file)
 
+def should_log_level(level: str, current_level: str) -> bool:
+    """Check if a log level should be shown based on current log level setting."""
+    levels = {"ERROR": 0, "WARN": 1, "INFO": 2}
+    return levels.get(level, 2) <= levels.get(current_level, 2)
+
 # ------------------ Config & State ------------------
 
 def load_config(args=None):
@@ -99,6 +105,7 @@ def load_config(args=None):
         "TRANSLATE_TO": os.getenv("YT_TRANSLATE_TO", "en").strip() or "en",
         "ACCEPT_NON_EN": os.getenv("YT_ACCEPT_NON_EN", "1").strip() not in ("0", "false", "False"),
         "LOG_SKIPS": os.getenv("YT_LOG_SKIPS", "1").strip() not in ("0", "false", "False"),
+        "LOG_LEVEL": os.getenv("YT_LOG_LEVEL", "ERROR").strip().upper(),
         "STATE_FILE": os.getenv("YT_STATE_FILE", "yt_state.json"),
         "TAKEOUT_WATCH_HISTORY_JSON": os.getenv("YT_TAKEOUT_WATCH_JSON", "").strip(),
         "MARK_PROCESSED_ON_NO_TRANSCRIPT": os.getenv("YT_MARK_PROCESSED_ON_NO_TRANSCRIPT", "0").strip() in ("1","true","True"),
@@ -119,6 +126,8 @@ def load_config(args=None):
             cfg["YT_MAX_VIDEOS"] = args.max_videos
         if getattr(args, 'per_channel_limit', None) is not None:
             cfg["YT_PER_CHANNEL_LIMIT"] = args.per_channel_limit
+        if getattr(args, 'log_level', None) is not None:
+            cfg["LOG_LEVEL"] = args.log_level
     
     return cfg
 
@@ -315,7 +324,7 @@ def _parse_iso8601_duration_to_seconds(s: str) -> int:
             elif ch == "S": sec = int(num or 0); num = ""
     return h*3600 + m*60 + sec
 
-def exclude_shorts(youtube, videos: List[Dict], max_seconds: int) -> List[Dict]:
+def exclude_shorts(youtube, videos: List[Dict], max_seconds: int, log_level: str = "INFO", dryrun: bool = False) -> List[Dict]:
     if not videos:
         return videos
     kept: List[Dict] = []
@@ -330,7 +339,7 @@ def exclude_shorts(youtube, videos: List[Dict], max_seconds: int) -> List[Dict]:
             secs = _parse_iso8601_duration_to_seconds(dur or "PT0S")
             if secs > max_seconds:
                 kept.append(v)
-            else:
+            elif dryrun or should_log_level("INFO", log_level):
                 log_message(f"[skip] SHORT ({secs}s) {v['channelTitle']} — {v['title']}", file=sys.stderr)
     return kept
 
@@ -782,6 +791,7 @@ def main():
     ap.add_argument("--max-age-days", type=int, help="Override YT_MAX_AGE_DAYS from .env file.")
     ap.add_argument("--max-videos", type=int, help="Override YT_MAX_VIDEOS from .env file.")
     ap.add_argument("--per-channel-limit", type=int, help="Override YT_PER_CHANNEL_LIMIT from .env file.")
+    ap.add_argument("--log-level", choices=["ERROR", "WARN", "INFO"], help="Set logging level (ERROR, WARN, INFO)")
     args = ap.parse_args()
 
     cfg = load_config(args)
@@ -909,7 +919,7 @@ def main():
     # Shorts exclusion (all modes)
     if cfg["EXCLUDE_SHORTS"] and candidates and not QUOTA_EXHAUSTED:
         before = len(candidates)
-        candidates = exclude_shorts(youtube, candidates, cfg["SHORTS_MAX_SECONDS"])
+        candidates = exclude_shorts(youtube, candidates, cfg["SHORTS_MAX_SECONDS"], cfg["LOG_LEVEL"], args.dryrun)
         log_message(f"After Shorts filter: kept {len(candidates)}/{before}")
     elif cfg["EXCLUDE_SHORTS"] and candidates and QUOTA_EXHAUSTED:
         log_message(f"Skipping Shorts filter due to quota exhaustion. Processing {len(candidates)} videos as-is.")
@@ -920,15 +930,15 @@ def main():
     for v in candidates:
         vid = v["videoId"]
         if vid in processed_ids:
-            if cfg["LOG_SKIPS"]:
+            if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
                 log_message(f"[skip] already processed: {v['channelTitle']} — {v['title']}", file=sys.stderr)
             continue
         if vid in video_errors:
-            if cfg["LOG_SKIPS"]:
+            if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
                 log_message(f"[skip] previous error ({video_errors[vid]}): {v['channelTitle']} — {v['title']}", file=sys.stderr)
             continue
         if takeout_ids and vid in takeout_ids:
-            if cfg["LOG_SKIPS"]:
+            if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
                 log_message(f"[skip] in watch history: {v['channelTitle']} — {v['title']}", file=sys.stderr)
             continue
         filtered.append(v)
@@ -992,7 +1002,7 @@ def main():
             # Store the error type for this video to avoid retrying
             error_type = type(e).__name__
             video_errors[vid] = error_type
-            if cfg["LOG_SKIPS"]:
+            if cfg["LOG_SKIPS"] and should_log_level("WARN", cfg["LOG_LEVEL"]):
                 log_message(f"[skip] {vid} transcript error recorded: {error_type}", file=sys.stderr)
             continue
         
