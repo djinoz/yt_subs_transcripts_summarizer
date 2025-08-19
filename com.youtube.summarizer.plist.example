@@ -26,6 +26,9 @@
     <true/>
     
     <key>KeepAlive</key>
-    <false/>
+    <dict>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
 </dict>
 </plist>
