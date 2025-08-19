@@ -25,6 +25,7 @@
 #   YT_TRANSLATE_TO=en
 #   YT_ACCEPT_NON_EN=1
 #   YT_MARK_PROCESSED_ON_NO_TRANSCRIPT=0
+#   YT_LOG_LEVEL=ERROR                  # ERROR, WARN, INFO (default ERROR)
 #   OPENAI_API_KEY= (optional)
 #   OPENAI_MODEL=gpt-4o-mini
 
@@ -41,6 +42,16 @@ from dotenv import load_dotenv
 
 # Global flag to track quota exhaustion
 QUOTA_EXHAUSTED = False
+
+# OpenAI summarization prompt
+OPENAI_SUMMARY_PROMPT = (
+    "You are a concise assistant. Summarize the following YouTube transcript into:\n"
+    "1) A 120-200 word paragraph TL;DR\n"
+    "2) 5 bullet key takeaways\n"
+    "3) 3 suggested follow-up actions (if relevant)\n"
+    "4) 1 direct quote (up to 50 words) that captures the most salient point - could be the spiciest take, heterodoxical viewpoint, or crisp encapsulation\n"
+    "Keep it faithful and non-speculative."
+)
 
 from tqdm import tqdm
 
@@ -84,6 +95,11 @@ def log_message(message: str, file=sys.stdout):
     timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}", file=file)
 
+def should_log_level(level: str, current_level: str) -> bool:
+    """Check if a log level should be shown based on current log level setting."""
+    levels = {"ERROR": 0, "WARN": 1, "INFO": 2}
+    return levels.get(level, 2) <= levels.get(current_level, 2)
+
 # ------------------ Config & State ------------------
 
 def load_config(args=None):
@@ -99,6 +115,7 @@ def load_config(args=None):
         "TRANSLATE_TO": os.getenv("YT_TRANSLATE_TO", "en").strip() or "en",
         "ACCEPT_NON_EN": os.getenv("YT_ACCEPT_NON_EN", "1").strip() not in ("0", "false", "False"),
         "LOG_SKIPS": os.getenv("YT_LOG_SKIPS", "1").strip() not in ("0", "false", "False"),
+        "LOG_LEVEL": os.getenv("YT_LOG_LEVEL", "ERROR").strip().upper(),
         "STATE_FILE": os.getenv("YT_STATE_FILE", "yt_state.json"),
         "TAKEOUT_WATCH_HISTORY_JSON": os.getenv("YT_TAKEOUT_WATCH_JSON", "").strip(),
         "MARK_PROCESSED_ON_NO_TRANSCRIPT": os.getenv("YT_MARK_PROCESSED_ON_NO_TRANSCRIPT", "0").strip() in ("1","true","True"),
@@ -119,19 +136,30 @@ def load_config(args=None):
             cfg["YT_MAX_VIDEOS"] = args.max_videos
         if getattr(args, 'per_channel_limit', None) is not None:
             cfg["YT_PER_CHANNEL_LIMIT"] = args.per_channel_limit
+        if getattr(args, 'log_level', None) is not None:
+            cfg["LOG_LEVEL"] = args.log_level
     
     return cfg
 
-def load_state(path: str) -> Set[str]:
+def load_state(path: str) -> Tuple[Set[str], Dict[str, str]]:
+    """Load state returning (processed_ids, video_errors)"""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return set(data.get("processed_video_ids", []))
+        processed_ids = set(data.get("processed_video_ids", []))
+        video_errors = data.get("video_errors", {})
+        return processed_ids, video_errors
     except Exception:
-        return set()
+        return set(), {}
 
-def save_state(path: str, processed_ids: Set[str]):
-    tmp = {"processed_video_ids": sorted(processed_ids)}
+def save_state(path: str, processed_ids: Set[str], video_errors: Dict[str, str] = None):
+    """Save state with processed IDs and error information"""
+    if video_errors is None:
+        video_errors = {}
+    tmp = {
+        "processed_video_ids": sorted(processed_ids),
+        "video_errors": video_errors
+    }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(tmp, f, indent=2)
 
@@ -306,7 +334,21 @@ def _parse_iso8601_duration_to_seconds(s: str) -> int:
             elif ch == "S": sec = int(num or 0); num = ""
     return h*3600 + m*60 + sec
 
-def exclude_shorts(youtube, videos: List[Dict], max_seconds: int) -> List[Dict]:
+def _format_duration(seconds: int) -> str:
+    """Format duration in seconds to MM:SS or HH:MM:SS format"""
+    if seconds < 0:
+        return "0:00"
+    
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    else:
+        return f"{minutes}:{secs:02d}"
+
+def exclude_shorts(youtube, videos: List[Dict], max_seconds: int, log_level: str = "INFO", dryrun: bool = False) -> List[Dict]:
     if not videos:
         return videos
     kept: List[Dict] = []
@@ -319,9 +361,12 @@ def exclude_shorts(youtube, videos: List[Dict], max_seconds: int) -> List[Dict]:
         for v in videos[i:i+50]:
             dur = details.get(v["videoId"], {}).get("duration")
             secs = _parse_iso8601_duration_to_seconds(dur or "PT0S")
+            # Add formatted duration to video object if not already present
+            if "duration" not in v:
+                v["duration"] = _format_duration(secs)
             if secs > max_seconds:
                 kept.append(v)
-            else:
+            elif dryrun or should_log_level("INFO", log_level):
                 log_message(f"[skip] SHORT ({secs}s) {v['channelTitle']} — {v['title']}", file=sys.stderr)
     return kept
 
@@ -671,9 +716,8 @@ def fetch_transcript_any_lang(
         log_message(f"- Use a residential IP address instead of cloud/datacenter IP", file=sys.stderr)
         sys.exit(1)
     except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript) as e:
-        if log_skips:
-            log_message(f"[skip] {video_id} no transcripts: {type(e).__name__}", file=sys.stderr)
-        return None
+        # Re-raise these errors so they can be caught and stored in the main loop
+        raise
     except Exception as e:
         reasons.append(f"B:fetch_any:{type(e).__name__}")
 
@@ -705,22 +749,22 @@ def summarize_local_textrank(text: str, sentences: int = 5) -> str:
     except Exception:
         return (text[:800] + "…") if len(text) > 800 else text
 
-def summarize_openai(text: str, api_key: str, model: str = "gpt-4o-mini") -> Dict[str, str]:
+def summarize_openai(text: str, api_key: str, model: str = "gpt-4o-mini") -> str:
     if not OpenAI:
         raise RuntimeError("openai package not available")
     client = OpenAI(api_key=api_key)
-    prompt = (
-        "You are a concise assistant. Summarize the following YouTube transcript into:\n"
-        "1) A 120-200 word paragraph TL;DR\n"
-        "2) 5 bullet key takeaways\n"
-        "3) 3 suggested follow-up actions (if relevant)\n"
-        "Keep it faithful and non-speculative."
+    content = [
+        {"type": "text", "text": OPENAI_SUMMARY_PROMPT},
+        {"type": "text", "text": text[:150000]}
+    ]
+    resp = client.chat.completions.create(
+        model=model, 
+        messages=[{"role": "user", "content": content}], 
+        temperature=0.2
     )
-    content = [{"type": "text", "text": prompt}, {"type": "text", "text": text[:150000]}]
-    resp = client.chat.completions.create(model=model, messages=[{"role": "user", "content": content}], temperature=0.2)
-    return {"summary": resp.choices[0].message.content.strip()}
+    return resp.choices[0].message.content.strip()
 
-def save_markdown(out_dir: pathlib.Path, video: Dict, transcript_info: Dict[str, str], summary_block: str):
+def save_markdown(out_dir: pathlib.Path, video: Dict, transcript_info: Dict[str, str], summary_block: str, youtube=None):
     out_dir.mkdir(parents=True, exist_ok=True)
     published = iso_to_dt(video["publishedAt"]).astimezone(dt.timezone.utc).strftime("%Y-%m-%d")
     # Decode HTML entities first, then clean for filesystem
@@ -735,9 +779,27 @@ def save_markdown(out_dir: pathlib.Path, video: Dict, transcript_info: Dict[str,
     # Use video owner channel title if different from channel title (for playlists)
     display_channel = video.get("videoOwnerChannelTitle", video["channelTitle"])
     
+    # Get duration if available, otherwise try to fetch it
+    duration_display = video.get("duration")
+    if duration_display is None and youtube:
+        try:
+            req = youtube.videos().list(part="contentDetails", id=video["videoId"])
+            resp = _execute_with_backoff(req, "videos.list:duration")
+            if resp and resp.get("items"):
+                duration_iso = resp["items"][0].get("contentDetails", {}).get("duration", "PT0S")
+                duration_seconds = _parse_iso8601_duration_to_seconds(duration_iso)
+                duration_display = _format_duration(duration_seconds)
+            else:
+                duration_display = "Unknown"
+        except Exception:
+            duration_display = "Unknown"
+    elif duration_display is None:
+        duration_display = "Unknown"
+    
     # YAML moved to bottom - decode HTML entities for clean display
     md = f"""# {clean_title}
 **Channel:** {html.unescape(display_channel)}  
+**Duration:** {duration_display}  
 **Published:** {video['publishedAt']}  
 **Link:** {url}
 
@@ -774,6 +836,7 @@ def main():
     ap.add_argument("--max-age-days", type=int, help="Override YT_MAX_AGE_DAYS from .env file.")
     ap.add_argument("--max-videos", type=int, help="Override YT_MAX_VIDEOS from .env file.")
     ap.add_argument("--per-channel-limit", type=int, help="Override YT_PER_CHANNEL_LIMIT from .env file.")
+    ap.add_argument("--log-level", choices=["ERROR", "WARN", "INFO"], help="Set logging level (ERROR, WARN, INFO)")
     args = ap.parse_args()
 
     cfg = load_config(args)
@@ -789,7 +852,7 @@ def main():
 
     # State & optional watch-history
     state_file = cfg["STATE_FILE"]
-    processed_ids = load_state(state_file)
+    processed_ids, video_errors = load_state(state_file)
     takeout_ids = load_takeout_history_ids(cfg["TAKEOUT_WATCH_HISTORY_JSON"])
     if takeout_ids:
         log_message(f"Loaded {len(takeout_ids)} watched IDs from Takeout.")
@@ -809,9 +872,9 @@ def main():
         pid, pl_title = resolved
         human_context = f'Playlist: "{pl_title}"'
         log_message(f'Using playlist: {pl_title}')
-        videos, _title = list_videos_from_playlist_id(youtube, pid, cfg["YT_MAX_AGE_DAYS"])
+        videos, _title = list_videos_from_playlist_id(youtube, pid, 0)  # No age filter for explicit playlists
         candidates = videos
-        log_message(f"Candidates from playlist after age filter: {len(candidates)}")
+        log_message(f"Candidates from playlist: {len(candidates)}")
 
     elif args.urls is not None:
         if len(args.urls) == 0:
@@ -833,12 +896,15 @@ def main():
                 continue
             for it in resp.get("items", []):
                 try:
+                    duration_iso = it.get("contentDetails", {}).get("duration", "PT0S")
+                    duration_seconds = _parse_iso8601_duration_to_seconds(duration_iso)
                     candidates.append({
                         "videoId": it["id"],
                         "publishedAt": it["snippet"]["publishedAt"],
                         "title": it["snippet"]["title"],
                         "channelTitle": it["snippet"]["channelTitle"],
                         "videoOwnerChannelTitle": it["snippet"]["channelTitle"],  # Same as channelTitle for individual videos
+                        "duration": _format_duration(duration_seconds),
                     })
                 except Exception:
                     continue
@@ -901,22 +967,26 @@ def main():
     # Shorts exclusion (all modes)
     if cfg["EXCLUDE_SHORTS"] and candidates and not QUOTA_EXHAUSTED:
         before = len(candidates)
-        candidates = exclude_shorts(youtube, candidates, cfg["SHORTS_MAX_SECONDS"])
+        candidates = exclude_shorts(youtube, candidates, cfg["SHORTS_MAX_SECONDS"], cfg["LOG_LEVEL"], args.dryrun)
         log_message(f"After Shorts filter: kept {len(candidates)}/{before}")
     elif cfg["EXCLUDE_SHORTS"] and candidates and QUOTA_EXHAUSTED:
         log_message(f"Skipping Shorts filter due to quota exhaustion. Processing {len(candidates)} videos as-is.")
 
-    # Unwatched proxy: remove already processed & (optionally) watched via Takeout
+    # Unwatched proxy: remove already processed, errored videos & (optionally) watched via Takeout
     before = len(candidates)
     filtered = []
     for v in candidates:
         vid = v["videoId"]
         if vid in processed_ids:
-            if cfg["LOG_SKIPS"]:
+            if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
                 log_message(f"[skip] already processed: {v['channelTitle']} — {v['title']}", file=sys.stderr)
             continue
+        if vid in video_errors:
+            if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
+                log_message(f"[skip] previous error ({video_errors[vid]}): {v['channelTitle']} — {v['title']}", file=sys.stderr)
+            continue
         if takeout_ids and vid in takeout_ids:
-            if cfg["LOG_SKIPS"]:
+            if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
                 log_message(f"[skip] in watch history: {v['channelTitle']} — {v['title']}", file=sys.stderr)
             continue
         filtered.append(v)
@@ -933,7 +1003,7 @@ def main():
     if not candidates:
         log_message("No videos to process after filters.")
         if not args.dryrun and not args.skip_state:
-            save_state(state_file, processed_ids)
+            save_state(state_file, processed_ids, video_errors)
         return
 
     if args.dryrun:
@@ -945,6 +1015,28 @@ def main():
             if args.show_transcripts:
                 info_line = _list_transcripts_debug(vid, cfg["COOKIES_FILE"], proxies)
                 log_message(f"  captions available: {info_line}")
+            try:
+                info = fetch_transcript_any_lang(
+                    vid,
+                    pref_langs=cfg["PREF_LANGS"],
+                    translate_to=cfg["TRANSLATE_TO"],
+                    accept_non_en=cfg["ACCEPT_NON_EN"],
+                    log_skips=cfg["LOG_SKIPS"],
+                    cookies_path=cfg["COOKIES_FILE"],
+                    proxies=proxies,
+                )
+                snippet = ("not found" if not info else (info["text"][:100].replace("\n", " ") + ("…" if len(info["text"])>100 else "")))
+            except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript) as e:
+                snippet = f"error: {type(e).__name__}"
+            log_message(f"  transcript: {snippet}")
+        log_message("---- END DRY RUN ----")
+        return
+
+    log_message(f"Processing {len(candidates)} videos…")
+    saved = 0
+    for v in tqdm(candidates, desc="Summarizing"):
+        vid = v["videoId"]
+        try:
             info = fetch_transcript_any_lang(
                 vid,
                 pref_langs=cfg["PREF_LANGS"],
@@ -954,43 +1046,28 @@ def main():
                 cookies_path=cfg["COOKIES_FILE"],
                 proxies=proxies,
             )
-            snippet = ("not found" if not info else (info["text"][:100].replace("\n", " ") + ("…" if len(info["text"])>100 else "")))
-            log_message(f"  transcript: {snippet}")
-        log_message("---- END DRY RUN ----")
-        return
-
-    log_message(f"Processing {len(candidates)} videos…")
-    saved = 0
-    for v in tqdm(candidates, desc="Summarizing"):
-        vid = v["videoId"]
-        info = fetch_transcript_any_lang(
-            vid,
-            pref_langs=cfg["PREF_LANGS"],
-            translate_to=cfg["TRANSLATE_TO"],
-            accept_non_en=cfg["ACCEPT_NON_EN"],
-            log_skips=cfg["LOG_SKIPS"],
-            cookies_path=cfg["COOKIES_FILE"],
-            proxies=proxies,
-        )
+        except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript) as e:
+            # Store the error type for this video to avoid retrying
+            error_type = type(e).__name__
+            video_errors[vid] = error_type
+            if cfg["LOG_SKIPS"] and should_log_level("WARN", cfg["LOG_LEVEL"]):
+                log_message(f"[skip] {vid} transcript error recorded: {error_type}", file=sys.stderr)
+            continue
+        
         if not info:
             if cfg["MARK_PROCESSED_ON_NO_TRANSCRIPT"] and not args.skip_state:
                 processed_ids.add(vid)
             continue
         try:
             if use_openai:
-                client = OpenAI(api_key=cfg["OPENAI_API_KEY"])
-                resp = client.chat.completions.create(
-                    model=cfg["OPENAI_MODEL"],
-                    messages=[{"role": "user", "content": [
-                        {"type":"text","text":"You are a concise assistant. Summarize the following YouTube transcript into:\n1) A 120-200 word paragraph TL;DR\n2) 5 bullet key takeaways\n3) 3 suggested follow-up actions (if relevant)\nKeep it faithful and non-speculative."},
-                        {"type":"text","text":info["text"][:150000]}
-                    ]}],
-                    temperature=0.2,
+                summary_block = summarize_openai(
+                    info["text"], 
+                    cfg["OPENAI_API_KEY"], 
+                    cfg["OPENAI_MODEL"]
                 )
-                summary_block = resp.choices[0].message.content.strip()
             else:
                 summary_block = summarize_local_textrank(info["text"], sentences=6)
-            save_markdown(out_dir, v, info, summary_block)
+            save_markdown(out_dir, v, info, summary_block, youtube)
             saved += 1
             if not args.skip_state:
                 processed_ids.add(vid)
@@ -998,7 +1075,7 @@ def main():
             log_message(f"[warn] failed to save/mark {vid}: {e}", file=sys.stderr)
 
     if not args.skip_state:
-        save_state(state_file, processed_ids)
+        save_state(state_file, processed_ids, video_errors)
     
     # Final summary message
     if QUOTA_EXHAUSTED:
