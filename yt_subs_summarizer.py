@@ -92,7 +92,7 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
 
 def log_message(message: str, file=sys.stdout):
     """Prints a message to the specified file stream with a timestamp."""
-    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}", file=file)
 
 def should_log_level(level: str, current_level: str) -> bool:
@@ -405,7 +405,7 @@ def get_recent_subscription_videos_efficient(youtube, max_videos: int, max_age_d
     log_message(f"Searching recent videos from {len(channels)} most active subscribed channels…")
     
     # Now use search API to get recent videos from these channels
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max_age_days) if max_age_days > 0 else None
+    cutoff = dt.datetime.now().astimezone() - dt.timedelta(days=max_age_days) if max_age_days > 0 else None
     videos = []
     
     for channel in channels[:20]:  # Increased from 10 to process more channels
@@ -448,7 +448,7 @@ def iter_recent_from_uploads(youtube, uploads_info: List[Dict], per_channel_max_
     """First page per uploads playlist; per-channel age filter & cap."""
     cutoff = None
     if per_channel_max_age_days and per_channel_max_age_days > 0:
-        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=per_channel_max_age_days)
+        cutoff = dt.datetime.now().astimezone() - dt.timedelta(days=per_channel_max_age_days)
     videos: List[Dict] = []
     for entry in tqdm(uploads_info, desc="Scanning subscriptions"):
         pid = entry["playlist_id"]; channel_title = entry["channel_title"]
@@ -461,7 +461,7 @@ def iter_recent_from_uploads(youtube, uploads_info: List[Dict], per_channel_max_
         got = 0
         for item in resp.get("items", []):
             try:
-                published_at = iso_to_dt(item["contentDetails"]["videoPublishedAt"]).astimezone(dt.timezone.utc)
+                published_at = iso_to_dt(item["contentDetails"]["videoPublishedAt"]).astimezone()
             except Exception:
                 continue
             if cutoff and published_at < cutoff:
@@ -490,14 +490,14 @@ def list_videos_from_playlist_id(youtube, playlist_id: str, max_age_days: int) -
     playlist_title = (pl_resp.get("items",[{}])[0].get("snippet",{}) or {}).get("title","(playlist)")
     cutoff = None
     if max_age_days and max_age_days > 0:
-        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max_age_days)
+        cutoff = dt.datetime.now().astimezone() - dt.timedelta(days=max_age_days)
     out: List[Dict] = []
     req = youtube.playlistItems().list(part="snippet,contentDetails", playlistId=playlist_id, maxResults=50)
     resp = _execute_with_backoff(req, f"playlistItems.list:{playlist_title}")
     if resp:
         for item in resp.get("items", []):
             try:
-                published_at = iso_to_dt(item["contentDetails"]["videoPublishedAt"]).astimezone(dt.timezone.utc)
+                published_at = iso_to_dt(item["contentDetails"]["videoPublishedAt"]).astimezone()
             except Exception:
                 continue
             if cutoff and published_at < cutoff:
@@ -766,7 +766,7 @@ def summarize_openai(text: str, api_key: str, model: str = "gpt-4o-mini") -> str
 
 def save_markdown(out_dir: pathlib.Path, video: Dict, transcript_info: Dict[str, str], summary_block: str, youtube=None):
     out_dir.mkdir(parents=True, exist_ok=True)
-    published = iso_to_dt(video["publishedAt"]).astimezone(dt.timezone.utc).strftime("%Y-%m-%d")
+    published = iso_to_dt(video["publishedAt"]).astimezone().strftime("%Y-%m-%d")
     # Decode HTML entities first, then clean for filesystem
     clean_title = html.unescape(video["title"])
     safe_title = "".join(c for c in clean_title if c not in r'\/:*?"<>|').strip()
