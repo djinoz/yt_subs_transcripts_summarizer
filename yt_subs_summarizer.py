@@ -14,7 +14,7 @@
 #   YT_MAX_AGE_DAYS=14
 #   YT_PER_CHANNEL_LIMIT=3
 #   YT_EXCLUDE_SHORTS=1
-#   YT_SHORTS_MAX_SECONDS=65
+#   YT_SHORTS_MAX_SECONDS=180
 #   YT_STATE_FILE=yt_state.json
 #   YT_USE_EFFICIENT_API=1              # use efficient API (default, recommended)
 #   YT_TAKEOUT_WATCH_JSON=
@@ -120,7 +120,7 @@ def load_config(args=None):
         "TAKEOUT_WATCH_HISTORY_JSON": os.getenv("YT_TAKEOUT_WATCH_JSON", "").strip(),
         "MARK_PROCESSED_ON_NO_TRANSCRIPT": os.getenv("YT_MARK_PROCESSED_ON_NO_TRANSCRIPT", "0").strip() in ("1","true","True"),
         "EXCLUDE_SHORTS": os.getenv("YT_EXCLUDE_SHORTS", "1").strip() not in ("0","false","False"),
-        "SHORTS_MAX_SECONDS": int(os.getenv("YT_SHORTS_MAX_SECONDS", "65")),
+        "SHORTS_MAX_SECONDS": int(os.getenv("YT_SHORTS_MAX_SECONDS", "180")),
         # cookies + proxy support for transcript fetching
         "COOKIES_FILE": os.getenv("YT_COOKIES_FILE", "").strip() or None,
         "HTTP_PROXY": os.getenv("HTTP_PROXY", "").strip() or None,
