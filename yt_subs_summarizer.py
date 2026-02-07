@@ -141,23 +141,59 @@ def load_config(args=None):
     
     return cfg
 
-def load_state(path: str) -> Tuple[Set[str], Dict[str, str]]:
-    """Load state returning (processed_ids, video_errors)"""
+def load_state(path: str, max_age_days: int = 14) -> Tuple[Set[str], Dict[str, str], Dict[str, float]]:
+    """
+    Load state returning (processed_ids, video_errors, processed_timestamps).
+    
+    Migrates old format (list) to new format (dict with timestamps).
+    Prunes entries older than max_age_days.
+    """
+    import time
+    
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        processed_ids = set(data.get("processed_video_ids", []))
+        
+        # Read processed videos (support both old and new format)
+        processed_timestamps = data.get("processed_timestamps", {})
+        old_list = data.get("processed_video_ids", [])
+        
+        # Migrate old format entries to current timestamp
+        current_time = time.time()
+        for vid in old_list:
+            if vid not in processed_timestamps:
+                processed_timestamps[vid] = current_time
+        
+        # Prune old entries (older than max_age_days)
+        cutoff_time = current_time - (max_age_days * 86400)
+        processed_timestamps = {
+            vid: ts for vid, ts in processed_timestamps.items()
+            if ts > cutoff_time
+        }
+        
+        processed_ids = set(processed_timestamps.keys())
         video_errors = data.get("video_errors", {})
-        return processed_ids, video_errors
+        return processed_ids, video_errors, processed_timestamps
     except Exception:
-        return set(), {}
+        return set(), {}, {}
 
-def save_state(path: str, processed_ids: Set[str], video_errors: Dict[str, str] = None):
-    """Save state with processed IDs and error information"""
+def save_state(path: str, processed_ids: Set[str], video_errors: Dict[str, str] = None, processed_timestamps: Dict[str, float] = None):
+    """Save state with processed IDs (with timestamps) and error information"""
+    import time
+    
     if video_errors is None:
         video_errors = {}
+    if processed_timestamps is None:
+        processed_timestamps = {}
+    
+    # Ensure all processed_ids have timestamps
+    current_time = time.time()
+    for vid in processed_ids:
+        if vid not in processed_timestamps:
+            processed_timestamps[vid] = current_time
+    
     tmp = {
-        "processed_video_ids": sorted(processed_ids),
+        "processed_timestamps": processed_timestamps,
         "video_errors": video_errors
     }
     with open(path, "w", encoding="utf-8") as f:
@@ -349,25 +385,63 @@ def _format_duration(seconds: int) -> str:
         return f"{minutes}:{secs:02d}"
 
 def exclude_shorts(youtube, videos: List[Dict], max_seconds: int, log_level: str = "INFO", dryrun: bool = False) -> List[Dict]:
+    """
+    Filter out YouTube Shorts based on duration.
+
+    This filter should ALWAYS be applied when EXCLUDE_SHORTS is enabled, regardless of quota status.
+    If quota is exhausted, we filter based on any duration data already present in the video objects.
+    Videos without duration data will be kept (conservative approach to avoid over-filtering).
+    """
     if not videos:
         return videos
+
     kept: List[Dict] = []
-    ids = [v["videoId"] for v in videos]
-    for i in range(0, len(ids), 50):
-        chunk = ids[i:i+50]
-        req = youtube.videos().list(part="contentDetails", id=",".join(chunk))
-        resp = _execute_with_backoff(req, "videos.list")
-        details = {item["id"]: item.get("contentDetails", {}) for item in (resp.get("items", []) if resp else [])}
-        for v in videos[i:i+50]:
-            dur = details.get(v["videoId"], {}).get("duration")
-            secs = _parse_iso8601_duration_to_seconds(dur or "PT0S")
-            # Add formatted duration to video object if not already present
+    videos_needing_duration: List[Dict] = []
+
+    # First pass: filter videos that already have duration data
+    for v in videos:
+        if "duration_seconds" in v:
+            # Duration already known (from --urls mode or previous fetch)
+            secs = v["duration_seconds"]
             if "duration" not in v:
                 v["duration"] = _format_duration(secs)
             if secs > max_seconds:
                 kept.append(v)
             elif dryrun or should_log_level("INFO", log_level):
                 log_message(f"[skip] SHORT ({secs}s) {v['channelTitle']} — {v['title']}", file=sys.stderr)
+        else:
+            # Need to fetch duration
+            videos_needing_duration.append(v)
+
+    # Second pass: fetch durations for videos that don't have it yet
+    # This will respect QUOTA_EXHAUSTED flag via _execute_with_backoff
+    if videos_needing_duration:
+        ids = [v["videoId"] for v in videos_needing_duration]
+        for i in range(0, len(ids), 50):
+            chunk = ids[i:i+50]
+            req = youtube.videos().list(part="contentDetails", id=",".join(chunk))
+            resp = _execute_with_backoff(req, "videos.list:shorts_filter")
+
+            if resp:
+                # Successfully fetched duration data
+                details = {item["id"]: item.get("contentDetails", {}) for item in resp.get("items", [])}
+                for v in videos_needing_duration[i:i+50]:
+                    dur = details.get(v["videoId"], {}).get("duration")
+                    secs = _parse_iso8601_duration_to_seconds(dur or "PT0S")
+                    v["duration_seconds"] = secs
+                    if "duration" not in v:
+                        v["duration"] = _format_duration(secs)
+                    if secs > max_seconds:
+                        kept.append(v)
+                    elif dryrun or should_log_level("INFO", log_level):
+                        log_message(f"[skip] SHORT ({secs}s) {v['channelTitle']} — {v['title']}", file=sys.stderr)
+            else:
+                # API call failed (likely quota exhausted) - keep videos conservatively
+                # Better to process a few shorts than to skip legitimate long-form content
+                if should_log_level("WARN", log_level):
+                    log_message(f"[warn] Could not fetch duration for {len(videos_needing_duration[i:i+50])} videos (likely quota exhausted). Keeping them to avoid over-filtering.", file=sys.stderr)
+                kept.extend(videos_needing_duration[i:i+50])
+
     return kept
 
 # ------------------ Efficient Subscription API ------------------
@@ -852,7 +926,7 @@ def main():
 
     # State & optional watch-history
     state_file = cfg["STATE_FILE"]
-    processed_ids, video_errors = load_state(state_file)
+    processed_ids, video_errors, processed_timestamps = load_state(state_file, cfg["YT_MAX_AGE_DAYS"])
     takeout_ids = load_takeout_history_ids(cfg["TAKEOUT_WATCH_HISTORY_JSON"])
     if takeout_ids:
         log_message(f"Loaded {len(takeout_ids)} watched IDs from Takeout.")
@@ -905,6 +979,7 @@ def main():
                         "channelTitle": it["snippet"]["channelTitle"],
                         "videoOwnerChannelTitle": it["snippet"]["channelTitle"],  # Same as channelTitle for individual videos
                         "duration": _format_duration(duration_seconds),
+                        "duration_seconds": duration_seconds,  # Store raw seconds for shorts filter
                     })
                 except Exception:
                     continue
@@ -965,12 +1040,12 @@ def main():
                     raise
 
     # Shorts exclusion (all modes)
-    if cfg["EXCLUDE_SHORTS"] and candidates and not QUOTA_EXHAUSTED:
+    # ALWAYS apply shorts filter when enabled, regardless of quota status
+    # The exclude_shorts function will handle quota exhaustion gracefully
+    if cfg["EXCLUDE_SHORTS"] and candidates:
         before = len(candidates)
         candidates = exclude_shorts(youtube, candidates, cfg["SHORTS_MAX_SECONDS"], cfg["LOG_LEVEL"], args.dryrun)
         log_message(f"After Shorts filter: kept {len(candidates)}/{before}")
-    elif cfg["EXCLUDE_SHORTS"] and candidates and QUOTA_EXHAUSTED:
-        log_message(f"Skipping Shorts filter due to quota exhaustion. Processing {len(candidates)} videos as-is.")
 
     # Unwatched proxy: remove already processed, errored videos & (optionally) watched via Takeout
     before = len(candidates)
@@ -1003,7 +1078,7 @@ def main():
     if not candidates:
         log_message("No videos to process after filters.")
         if not args.dryrun and not args.skip_state:
-            save_state(state_file, processed_ids, video_errors)
+            save_state(state_file, processed_ids, video_errors, processed_timestamps)
         return
 
     if args.dryrun:
@@ -1075,7 +1150,7 @@ def main():
             log_message(f"[warn] failed to save/mark {vid}: {e}", file=sys.stderr)
 
     if not args.skip_state:
-        save_state(state_file, processed_ids, video_errors)
+        save_state(state_file, processed_ids, video_errors, processed_timestamps)
     
     # Final summary message
     if QUOTA_EXHAUSTED:
