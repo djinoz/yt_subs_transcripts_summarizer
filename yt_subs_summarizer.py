@@ -755,9 +755,15 @@ def fetch_transcript_any_lang(
     # --- A) Try preferred languages first
     try:
         fetched_transcript = api.fetch(video_id, languages=pref_langs)
-        text = " ".join(snippet.text.strip() for snippet in fetched_transcript.snippets if snippet.text.strip())
-        if text:
-            return {"text": text, "lang": fetched_transcript.language_code, "translated": False}
+        # Verify valid transcript data
+        if not fetched_transcript.snippets:
+             reasons.append("A:empty_snippets")
+        else:
+             text = " ".join(snippet.text.strip() for snippet in fetched_transcript.snippets if snippet.text.strip())
+             if text:
+                 # Success: Log proof-of-life locally
+                 print(f"      [proof-of-life] {video_id} first 30 chars: {text[:30]}", file=sys.stderr)
+                 return {"text": text, "lang": fetched_transcript.language_code, "translated": False}
     except IpBlocked as e:
         log_message(f"\n❌ ERROR: YouTube is blocking requests from your IP address.", file=sys.stderr)
         log_message(f"This usually happens when:", file=sys.stderr)
@@ -775,9 +781,13 @@ def fetch_transcript_any_lang(
     try:
         # Try to fetch any available transcript (defaults to English)
         fetched_transcript = api.fetch(video_id)
-        text = " ".join(snippet.text.strip() for snippet in fetched_transcript.snippets if snippet.text.strip())
-        if text:
-            return {"text": text, "lang": fetched_transcript.language_code, "translated": False}
+        if not fetched_transcript.snippets:
+             reasons.append("B:empty_snippets")
+        else:
+             text = " ".join(snippet.text.strip() for snippet in fetched_transcript.snippets if snippet.text.strip())
+             if text:
+                 print(f"      [proof-of-life] {video_id} first 30 chars: {text[:30]}", file=sys.stderr)
+                 return {"text": text, "lang": fetched_transcript.language_code, "translated": False}
             
     except IpBlocked as e:
         log_message(f"\n❌ ERROR: YouTube is blocking requests from your IP address.", file=sys.stderr)
