@@ -3,6 +3,7 @@
 
 # Google OAuth credentials and tokens
 client_secret.json
+client_secret_*.json
 token.pickle
 
 # State and output files
