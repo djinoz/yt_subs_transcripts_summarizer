@@ -1,8 +1,8 @@
 google-api-python-client==2.134.0
 google-auth==2.35.0
 google-auth-oauthlib==1.2.1
-youtube-transcript-api==1.2.2
 tqdm==4.66.4
 sumy==0.11.0
 python-dotenv==1.0.1
 openai==1.99.9
+youtube-transcript-api==1.2.2

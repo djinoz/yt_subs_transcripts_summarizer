@@ -37,7 +37,7 @@ if pgrep -x openvpn > /dev/null; then
     echo "[$(date)] VPN connected. IP: $NEW_IP" | tee -a "$LOG_FILE"
     
     # Activate venv
-    source .venv/bin/activate
+    source venv/bin/activate
 
     # Run the summarizer
     echo "[$(date)] Running YouTube summarizer (playlist mode)..." | tee -a "$LOG_FILE"

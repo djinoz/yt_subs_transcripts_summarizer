@@ -49,7 +49,7 @@ fi
 # 2. Run the Summarizer
 echo "[$(date)] Running YouTube Summarizer..." | tee -a "$LOG_FILE"
 cd "$PROJECT_DIR"
-./venv/bin/python yt_subs_summarizer.py >> "$LOG_FILE" 2>&1
+./venv/bin/python yt_subs_summarizer.py "$@" >> "$LOG_FILE" 2>&1
 RESULT=$?
 
 # 3. Cleanup
