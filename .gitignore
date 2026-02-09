@@ -9,6 +9,8 @@ token.pickle
 # State and output files
 yt_state.json
 ToJoplin/
+logs/
+*.log
 
 # LaunchAgent configuration (contains user-specific paths)
 com.youtube.summarizer.plist
