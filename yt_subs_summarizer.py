@@ -561,6 +561,11 @@ def list_videos_from_playlist_id(youtube, playlist_id: str, max_age_days: int) -
     """First page of a specific playlist; returns (videos, playlist_title)."""
     pl_req = youtube.playlists().list(part="snippet", id=playlist_id, maxResults=1)
     pl_resp = _execute_with_backoff(pl_req, "playlists.get")
+    
+    # Handle quota exhaustion or failed fetch
+    if pl_resp is None:
+        return [], "(playlist)"
+        
     playlist_title = (pl_resp.get("items",[{}])[0].get("snippet",{}) or {}).get("title","(playlist)")
     cutoff = None
     if max_age_days and max_age_days > 0:

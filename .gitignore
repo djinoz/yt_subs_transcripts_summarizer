@@ -5,6 +5,8 @@
 client_secret.json
 client_secret_*.json
 token.pickle
+*.pem
+*.key
 
 # State and output files
 yt_state.json
