@@ -111,6 +111,9 @@ def load_config(args=None):
         "OUTPUT_DIR": os.getenv("OUTPUT_DIR", "./ToJoplin"),
         "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", "").strip(),
         "OPENAI_MODEL": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "OLLAMA_MODEL": os.getenv("OLLAMA_MODEL", "qwen2.5:14b"),
+        "OLLAMA_BASE_URL": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        "USE_OLLAMA": os.getenv("USE_OLLAMA", "0").strip() in ("1", "true", "True"),
         "PREF_LANGS": [s.strip() for s in os.getenv("YT_TRANSCR_PREF_LANGS", "en,en-US,en-GB,en-CA,en-AU").split(",") if s.strip()],
         "TRANSLATE_TO": os.getenv("YT_TRANSLATE_TO", "en").strip() or "en",
         "ACCEPT_NON_EN": os.getenv("YT_ACCEPT_NON_EN", "1").strip() not in ("0", "false", "False"),
@@ -753,9 +756,13 @@ def fetch_transcript_any_lang(
       B) Try translation to target language if available
       C) Accept any available language if accept_non_en
       D) yt-dlp fallback
+    
+    Returns: {"text": ..., "lang": ..., "translated": ..., "error_cause": ...} OR None
+    error_cause is populated when a specific error is diagnosed (used to skip retrying known failures)
     """
     reasons = []
     api = YouTubeTranscriptApi()
+    error_cause = None  # To be returned if fetch fails
 
     # --- A) Try preferred languages first
     try:
@@ -779,49 +786,86 @@ def fetch_transcript_any_lang(
         log_message(f"- Wait a few hours before trying again", file=sys.stderr)
         log_message(f"- Use a residential IP address instead of cloud/datacenter IP", file=sys.stderr)
         sys.exit(1)
+    except TranscriptsDisabled as e:
+        error_cause = "TRANSCRIPTS_DISABLED"
+        reasons.append(f"A:TranscriptsDisabled")
+    except NoTranscriptFound as e:
+        # This might be "no transcript in preferred language" or "no transcript at all"
+        error_cause = "NO_TRANSCRIPT_FOUND"
+        reasons.append(f"A:NoTranscriptFound")
+    except CouldNotRetrieveTranscript as e:
+        # Could mean video unavailable, private, deleted, or API error
+        error_msg = str(e).lower()
+        if "unavailable" in error_msg or "deleted" in error_msg or "removed" in error_msg:
+            error_cause = "VIDEO_UNAVAILABLE"
+        elif "private" in error_msg or "access" in error_msg:
+            error_cause = "VIDEO_PRIVATE"
+        else:
+            error_cause = "TRANSCRIPT_RETRIEVAL_FAILED"
+        reasons.append(f"A:CouldNotRetrieveTranscript:{error_cause}")
     except Exception as e:
         reasons.append(f"A:fetch_preferred:{type(e).__name__}")
 
-    # --- B) Try any available language
-    try:
-        # Try to fetch any available transcript (defaults to English)
-        fetched_transcript = api.fetch(video_id)
-        if not fetched_transcript.snippets:
-             reasons.append("B:empty_snippets")
-        else:
-             text = " ".join(snippet.text.strip() for snippet in fetched_transcript.snippets if snippet.text.strip())
-             if text:
-                 print(f"      [proof-of-life] {video_id} first 30 chars: {text[:30]}", file=sys.stderr)
-                 return {"text": text, "lang": fetched_transcript.language_code, "translated": False}
-            
-    except IpBlocked as e:
-        log_message(f"\n❌ ERROR: YouTube is blocking requests from your IP address.", file=sys.stderr)
-        log_message(f"This usually happens when:", file=sys.stderr)
-        log_message(f"- You've made too many requests and your IP has been temporarily blocked", file=sys.stderr)
-        log_message(f"- Your IP belongs to a cloud provider (AWS, Google Cloud, Azure, etc.)", file=sys.stderr)
-        log_message(f"\n💡 Solutions:", file=sys.stderr)
-        log_message(f"- Connect to a VPN and try again", file=sys.stderr)
-        log_message(f"- Wait a few hours before trying again", file=sys.stderr)
-        log_message(f"- Use a residential IP address instead of cloud/datacenter IP", file=sys.stderr)
-        sys.exit(1)
-    except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript) as e:
-        # Re-raise these errors so they can be caught and stored in the main loop
-        raise
-    except Exception as e:
-        reasons.append(f"B:fetch_any:{type(e).__name__}")
+    # --- B) Try any available language (only if not definitively unavailable/disabled)
+    if error_cause not in ("VIDEO_UNAVAILABLE", "TRANSCRIPTS_DISABLED"):
+        try:
+            # Try to fetch any available transcript (defaults to English)
+            fetched_transcript = api.fetch(video_id)
+            if not fetched_transcript.snippets:
+                 reasons.append("B:empty_snippets")
+            else:
+                 text = " ".join(snippet.text.strip() for snippet in fetched_transcript.snippets if snippet.text.strip())
+                 if text:
+                     print(f"      [proof-of-life] {video_id} first 30 chars: {text[:30]}", file=sys.stderr)
+                     return {"text": text, "lang": fetched_transcript.language_code, "translated": False}
+                
+        except IpBlocked as e:
+            log_message(f"\n❌ ERROR: YouTube is blocking requests from your IP address.", file=sys.stderr)
+            log_message(f"This usually happens when:", file=sys.stderr)
+            log_message(f"- You've made too many requests and your IP has been temporarily blocked", file=sys.stderr)
+            log_message(f"- Your IP belongs to a cloud provider (AWS, Google Cloud, Azure, etc.)", file=sys.stderr)
+            log_message(f"\n💡 Solutions:", file=sys.stderr)
+            log_message(f"- Connect to a VPN and try again", file=sys.stderr)
+            log_message(f"- Wait a few hours before trying again", file=sys.stderr)
+            log_message(f"- Use a residential IP address instead of cloud/datacenter IP", file=sys.stderr)
+            sys.exit(1)
+        except TranscriptsDisabled as e:
+            error_cause = "TRANSCRIPTS_DISABLED"
+            reasons.append("B:TranscriptsDisabled")
+        except NoTranscriptFound as e:
+            error_cause = "NO_TRANSCRIPT_FOUND"
+            reasons.append("B:NoTranscriptFound")
+        except CouldNotRetrieveTranscript as e:
+            error_msg = str(e).lower()
+            if "unavailable" in error_msg or "deleted" in error_msg or "removed" in error_msg:
+                error_cause = "VIDEO_UNAVAILABLE"
+            elif "private" in error_msg or "access" in error_msg:
+                error_cause = "VIDEO_PRIVATE"
+            else:
+                error_cause = "TRANSCRIPT_RETRIEVAL_FAILED"
+            reasons.append(f"B:CouldNotRetrieveTranscript:{error_cause}")
+        except Exception as e:
+            reasons.append(f"B:fetch_any:{type(e).__name__}")
 
-    # --- C) yt-dlp fallback
-    ytdlp_result = _fetch_transcript_via_ytdlp(video_id, cookies_path, proxies)
-    if ytdlp_result:
-        log_message(f"[fallback] {video_id} transcript fetched via yt-dlp", file=sys.stderr)
-        return ytdlp_result
+    # --- C) yt-dlp fallback (skip if video unavailable)
+    if error_cause != "VIDEO_UNAVAILABLE":
+        ytdlp_result = _fetch_transcript_via_ytdlp(video_id, cookies_path, proxies)
+        if ytdlp_result:
+            log_message(f"[fallback] {video_id} transcript fetched via yt-dlp", file=sys.stderr)
+            return ytdlp_result
 
+    # --- Failed to fetch transcript
     if log_skips:
-        if reasons:
+        if error_cause:
+            log_message(f"[skip] {video_id} [{error_cause}] — will not retry this video", file=sys.stderr)
+        elif reasons:
             log_message(f"[skip] {video_id} transcripts exist but were not retrievable. Reasons: {', '.join(reasons)}", file=sys.stderr)
         else:
             log_message(f"[skip] {video_id} transcripts exist but none usable with current policy", file=sys.stderr)
-    return None
+    
+    # Return None but include error_cause metadata for the main loop
+    # The main loop will check video_errors[vid] to determine if it should retry
+    return None  # Will be caught by main loop, which uses error_cause to mark permanently
 
 # ------------------ Summaries ------------------
 
@@ -852,6 +896,37 @@ def summarize_openai(text: str, api_key: str, model: str = "gpt-4o-mini") -> str
         temperature=0.2
     )
     return resp.choices[0].message.content.strip()
+
+def summarize_ollama(text: str, model: str = "qwen2.5:14b", base_url: str = "http://localhost:11434") -> str:
+    """Summarize using local Ollama model."""
+    import json
+    import urllib.request
+    
+    prompt = f"""{OPENAI_SUMMARY_PROMPT}
+
+{text[:150000]}"""
+    
+    data = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.2
+        }
+    }).encode('utf-8')
+    
+    req = urllib.request.Request(
+        f"{base_url}/api/generate",
+        data=data,
+        headers={'Content-Type': 'application/json'}
+    )
+    
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read())
+            return result.get('response', '').strip()
+    except Exception as e:
+        raise RuntimeError(f"Ollama API call failed: {e}")
 
 def save_markdown(out_dir: pathlib.Path, video: Dict, transcript_info: Dict[str, str], summary_block: str, youtube=None):
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -930,7 +1005,8 @@ def main():
 
     cfg = load_config(args)
     out_dir = pathlib.Path(cfg["OUTPUT_DIR"])
-    use_openai = bool(cfg["OPENAI_API_KEY"])
+    use_ollama = cfg["USE_OLLAMA"]
+    use_openai = bool(cfg["OPENAI_API_KEY"]) and not use_ollama
 
     # proxies map for youtube_transcript_api (and requests fallback)
     proxies = {}
@@ -1065,6 +1141,8 @@ def main():
     # Unwatched proxy: remove already processed, errored videos & (optionally) watched via Takeout
     before = len(candidates)
     filtered = []
+    error_categories = {"PERMANENT": 0, "TEMPORARY": 0, "UNKNOWN": 0}
+    
     for v in candidates:
         vid = v["videoId"]
         if vid in processed_ids:
@@ -1072,8 +1150,20 @@ def main():
                 log_message(f"[skip] already processed: {v['channelTitle']} — {v['title']}", file=sys.stderr)
             continue
         if vid in video_errors:
+            error_cause = video_errors[vid]
+            # Classify which errors are permanent vs. might be transient
+            if error_cause in ("TRANSCRIPTS_DISABLED", "VIDEO_UNAVAILABLE_OR_DELETED", "NO_TRANSCRIPT_FOUND", "VIDEO_PRIVATE_OR_RESTRICTED"):
+                error_categories["PERMANENT"] += 1
+                category = "PERMANENT"
+            elif error_cause in ("TRANSCRIPT_FETCH_ERROR", "CouldNotRetrieveTranscript"):
+                error_categories["TEMPORARY"] += 1
+                category = "TEMPORARY"
+            else:
+                error_categories["UNKNOWN"] += 1
+                category = "UNKNOWN"
+            
             if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
-                log_message(f"[skip] previous error ({video_errors[vid]}): {v['channelTitle']} — {v['title']}", file=sys.stderr)
+                log_message(f"[skip] previous error [{category}] {error_cause}: {v['channelTitle']} — {v['title']}", file=sys.stderr)
             continue
         if takeout_ids and vid in takeout_ids:
             if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
@@ -1082,6 +1172,8 @@ def main():
         filtered.append(v)
     candidates = filtered
     log_message(f"After unwatched proxy filter: kept {len(candidates)}/{before}")
+    if error_categories["PERMANENT"] > 0 or error_categories["TEMPORARY"] > 0:
+        log_message(f"  (Previous errors: {error_categories['PERMANENT']} PERMANENT, {error_categories['TEMPORARY']} TEMPORARY, {error_categories['UNKNOWN']} UNKNOWN)")
 
     # Sort newest-first & apply global cap (not for --urls)
     candidates.sort(key=lambda x: x.get("publishedAt",""), reverse=True)
@@ -1137,11 +1229,28 @@ def main():
                 proxies=proxies,
             )
         except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript) as e:
-            # Store the error type for this video to avoid retrying
+            # Diagnose the root cause to avoid retrying permanently-failed videos
             error_type = type(e).__name__
-            video_errors[vid] = error_type
+            error_msg = str(e).lower()
+            
+            # Classify the error cause
+            if error_type == "TranscriptsDisabled":
+                cause = "TRANSCRIPTS_DISABLED"
+            elif error_type == "NoTranscriptFound":
+                cause = "NO_TRANSCRIPT_FOUND"
+            elif error_type == "CouldNotRetrieveTranscript":
+                if any(x in error_msg for x in ["unavailable", "deleted", "removed", "not found"]):
+                    cause = "VIDEO_UNAVAILABLE_OR_DELETED"
+                elif any(x in error_msg for x in ["private", "access", "permission"]):
+                    cause = "VIDEO_PRIVATE_OR_RESTRICTED"
+                else:
+                    cause = "TRANSCRIPT_FETCH_ERROR"
+            else:
+                cause = error_type
+            
+            video_errors[vid] = cause
             if cfg["LOG_SKIPS"] and should_log_level("WARN", cfg["LOG_LEVEL"]):
-                log_message(f"[skip] {vid} transcript error recorded: {error_type}", file=sys.stderr)
+                log_message(f"[skip] {vid} [{cause}] — will not retry", file=sys.stderr)
             continue
         
         if not info:
@@ -1149,7 +1258,13 @@ def main():
                 processed_ids.add(vid)
             continue
         try:
-            if use_openai:
+            if use_ollama:
+                summary_block = summarize_ollama(
+                    info["text"],
+                    cfg["OLLAMA_MODEL"],
+                    cfg["OLLAMA_BASE_URL"]
+                )
+            elif use_openai:
                 summary_block = summarize_openai(
                     info["text"], 
                     cfg["OPENAI_API_KEY"], 
