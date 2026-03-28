@@ -16,6 +16,7 @@
 #   YT_EXCLUDE_SHORTS=1
 #   YT_SHORTS_MAX_SECONDS=180
 #   YT_STATE_FILE=yt_state.json
+#   YT_HISTORY_DB=yt_history.db
 #   YT_USE_EFFICIENT_API=1              # use efficient API (default, recommended)
 #   YT_TAKEOUT_WATCH_JSON=
 #   YT_COOKIES_FILE=~/youtube_cookies.txt   # cookies (Netscape) for gated captions
@@ -39,6 +40,15 @@ import datetime as dt
 import time
 import random
 from typing import List, Dict, Optional, Tuple, Set
+
+from history_db import (
+    HistoryDB,
+    MODE_PLAYLIST,
+    MODE_SUBSCRIPTION,
+    MODE_URLS,
+    ERROR_PERMANENT,
+    classify_transcript_failure,
+)
 
 from dotenv import load_dotenv
 
@@ -126,6 +136,8 @@ def load_config(args=None):
         "LOG_SKIPS": os.getenv("YT_LOG_SKIPS", "1").strip() not in ("0", "false", "False"),
         "LOG_LEVEL": os.getenv("YT_LOG_LEVEL", "ERROR").strip().upper(),
         "STATE_FILE": os.getenv("YT_STATE_FILE", "yt_state.json"),
+        "HISTORY_DB": os.getenv("YT_HISTORY_DB", "yt_history.db"),
+        "SUBSCRIPTION_HISTORY_RETENTION_DAYS": int(os.getenv("YT_SUBSCRIPTION_HISTORY_RETENTION_DAYS", "365")),
         "TAKEOUT_WATCH_HISTORY_JSON": os.getenv("YT_TAKEOUT_WATCH_JSON", "").strip(),
         "MARK_PROCESSED_ON_NO_TRANSCRIPT": os.getenv("YT_MARK_PROCESSED_ON_NO_TRANSCRIPT", "0").strip() in ("1","true","True"),
         "EXCLUDE_SHORTS": os.getenv("YT_EXCLUDE_SHORTS", "1").strip() not in ("0","false","False"),
@@ -153,63 +165,12 @@ def load_config(args=None):
     
     return cfg
 
-def load_state(path: str, max_age_days: int = 14) -> Tuple[Set[str], Dict[str, str], Dict[str, float]]:
-    """
-    Load state returning (processed_ids, video_errors, processed_timestamps).
-    
-    Migrates old format (list) to new format (dict with timestamps).
-    Prunes entries older than max_age_days.
-    """
-    import time
-    
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        
-        # Read processed videos (support both old and new format)
-        processed_timestamps = data.get("processed_timestamps", {})
-        old_list = data.get("processed_video_ids", [])
-        
-        # Migrate old format entries to current timestamp
-        current_time = time.time()
-        for vid in old_list:
-            if vid not in processed_timestamps:
-                processed_timestamps[vid] = current_time
-        
-        # Prune old entries (older than max_age_days)
-        cutoff_time = current_time - (max_age_days * 86400)
-        processed_timestamps = {
-            vid: ts for vid, ts in processed_timestamps.items()
-            if ts > cutoff_time
-        }
-        
-        processed_ids = set(processed_timestamps.keys())
-        video_errors = data.get("video_errors", {})
-        return processed_ids, video_errors, processed_timestamps
-    except Exception:
-        return set(), {}, {}
-
-def save_state(path: str, processed_ids: Set[str], video_errors: Dict[str, str] = None, processed_timestamps: Dict[str, float] = None):
-    """Save state with processed IDs (with timestamps) and error information"""
-    import time
-    
-    if video_errors is None:
-        video_errors = {}
-    if processed_timestamps is None:
-        processed_timestamps = {}
-    
-    # Ensure all processed_ids have timestamps
-    current_time = time.time()
-    for vid in processed_ids:
-        if vid not in processed_timestamps:
-            processed_timestamps[vid] = current_time
-    
-    tmp = {
-        "processed_timestamps": processed_timestamps,
-        "video_errors": video_errors
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(tmp, f, indent=2)
+def get_history_mode(args) -> str:
+    if args.playlist:
+        return MODE_PLAYLIST
+    if args.urls is not None:
+        return MODE_URLS
+    return MODE_SUBSCRIPTION
 
 _YT_URL_RE = re.compile(r"(?:v=|youtu\.be/)([A-Za-z0-9_\-]{11})")
 _YT_ID_RE  = re.compile(r"^[A-Za-z0-9_\-]{11}$")
@@ -1027,9 +988,12 @@ def main():
     if not proxies:
         proxies = None
 
-    # State & optional watch-history
+    # Durable history + optional watch-history
     state_file = cfg["STATE_FILE"]
-    processed_ids, video_errors, processed_timestamps = load_state(state_file, cfg["YT_MAX_AGE_DAYS"])
+    history_mode = get_history_mode(args)
+    history = HistoryDB(cfg["HISTORY_DB"], state_file=state_file)
+    history.prune_successes(MODE_SUBSCRIPTION, cfg["SUBSCRIPTION_HISTORY_RETENTION_DAYS"])
+    history.prune_successes(MODE_URLS, cfg["SUBSCRIPTION_HISTORY_RETENTION_DAYS"])
     takeout_ids = load_takeout_history_ids(cfg["TAKEOUT_WATCH_HISTORY_JSON"])
     if takeout_ids:
         log_message(f"Loaded {len(takeout_ids)} watched IDs from Takeout.")
@@ -1150,40 +1114,38 @@ def main():
         candidates = exclude_shorts(youtube, candidates, cfg["SHORTS_MAX_SECONDS"], cfg["LOG_LEVEL"], args.dryrun)
         log_message(f"After Shorts filter: kept {len(candidates)}/{before}")
 
-    # Unwatched proxy: remove already processed, errored videos & (optionally) watched via Takeout
+    # Unwatched proxy: remove already processed, permanently failed videos & (optionally) watched via Takeout
     before = len(candidates)
     filtered = []
     error_categories = {"PERMANENT": 0, "TEMPORARY": 0, "UNKNOWN": 0}
-    PERMANENT_ERRORS = {
-        "TRANSCRIPTS_DISABLED", "TranscriptsDisabled",
-        "VIDEO_UNAVAILABLE_OR_DELETED",
-        "NO_TRANSCRIPT_FOUND", "NoTranscriptFound",
-        "VIDEO_PRIVATE_OR_RESTRICTED",
-    }
-    TRANSIENT_ERRORS = {
-        "TRANSCRIPT_FETCH_ERROR", "CouldNotRetrieveTranscript",
-        "RequestBlocked", "IpBlocked", "AgeRestricted",
-    }
 
     for v in candidates:
         vid = v["videoId"]
-        if vid in processed_ids:
-            if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
-                log_message(f"[skip] already processed: {v['channelTitle']} — {v['title']}", file=sys.stderr)
-            continue
-        if vid in video_errors:
-            error_cause = video_errors[vid]
-            if error_cause in PERMANENT_ERRORS:
+        skip, reason = history.should_skip(
+            vid,
+            history_mode,
+            success_retention_days=cfg["SUBSCRIPTION_HISTORY_RETENTION_DAYS"],
+            skip_permanent_failures=True,
+        )
+        if skip:
+            entry = history.get_entry(vid, history_mode) or {}
+            if reason == "permanent_failure":
                 error_categories["PERMANENT"] += 1
                 if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
-                    log_message(f"[skip] previous error [PERMANENT] {error_cause}: {v['channelTitle']} — {v['title']}", file=sys.stderr)
+                    log_message(f"[skip] previous error [PERMANENT] {entry.get('error_type')}: {v['channelTitle']} — {v['title']}", file=sys.stderr)
                 continue
-            elif error_cause in TRANSIENT_ERRORS:
+            if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
+                log_message(f"[skip] already processed ({history_mode}): {v['channelTitle']} — {v['title']}", file=sys.stderr)
+            continue
+
+        entry = history.get_entry(vid, history_mode) or {}
+        if entry.get("status") == "failed":
+            if entry.get("error_type") == ERROR_PERMANENT:
+                error_categories["PERMANENT"] += 1
+            elif entry.get("error_type"):
                 error_categories["TEMPORARY"] += 1
-                # transient: retry this run (do not skip forever)
             else:
                 error_categories["UNKNOWN"] += 1
-                # unknown: retry this run by default
 
         if takeout_ids and vid in takeout_ids:
             if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
@@ -1204,8 +1166,6 @@ def main():
 
     if not candidates:
         log_message("No videos to process after filters.")
-        if not args.dryrun and not args.skip_state:
-            save_state(state_file, processed_ids, video_errors, processed_timestamps)
         return
 
     if args.dryrun:
@@ -1296,9 +1256,17 @@ def main():
             else:
                 cause = error_type
             
-            video_errors[vid] = cause
+            cause, error_kind = classify_transcript_failure(error_type, str(e))
+            if not args.skip_state:
+                history.record_failure(
+                    vid,
+                    history_mode,
+                    error_kind,
+                    title=v.get("title"),
+                    channel=v.get("videoOwnerChannelTitle", v.get("channelTitle")),
+                )
             if cfg["LOG_SKIPS"] and should_log_level("WARN", cfg["LOG_LEVEL"]):
-                if cause in ("TRANSCRIPTS_DISABLED", "VIDEO_UNAVAILABLE_OR_DELETED", "NO_TRANSCRIPT_FOUND", "VIDEO_PRIVATE_OR_RESTRICTED"):
+                if error_kind == ERROR_PERMANENT:
                     log_message(f"[skip] {vid} [{cause}] — treated as permanent", file=sys.stderr)
                 else:
                     log_message(f"[warn] {vid} [{cause}] — transient/unknown, will retry in future runs", file=sys.stderr)
@@ -1307,7 +1275,12 @@ def main():
         
         if not info:
             if cfg["MARK_PROCESSED_ON_NO_TRANSCRIPT"] and not args.skip_state:
-                processed_ids.add(vid)
+                history.record_success(
+                    vid,
+                    history_mode,
+                    title=v.get("title"),
+                    channel=v.get("videoOwnerChannelTitle", v.get("channelTitle")),
+                )
             human_pause(cfg)
             continue
         try:
@@ -1328,14 +1301,17 @@ def main():
             save_markdown(out_dir, v, info, summary_block, youtube)
             saved += 1
             if not args.skip_state:
-                processed_ids.add(vid)
+                history.record_success(
+                    vid,
+                    history_mode,
+                    title=v.get("title"),
+                    channel=v.get("videoOwnerChannelTitle", v.get("channelTitle")),
+                )
         except Exception as e:
             log_message(f"[warn] failed to save/mark {vid}: {e}", file=sys.stderr)
 
         human_pause(cfg)
 
-    if not args.skip_state:
-        save_state(state_file, processed_ids, video_errors, processed_timestamps)
     
     # Final summary message
     if QUOTA_EXHAUSTED:

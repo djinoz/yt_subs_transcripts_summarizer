@@ -24,7 +24,7 @@ Fetch transcripts for the **latest videos from channels you're subscribed to** a
 - **Rate limiting protection**: Safe to run regularly without hitting YouTube API limits
 - **Quota exhaustion handling**: Gracefully processes any retrieved videos even if API quota is exceeded
 - **IP blocking protection**: Graceful error handling with helpful troubleshooting messages
-- **State tracking**: Remembers processed videos to avoid duplicates
+- **Durable history tracking**: SQLite-backed history remembers processed videos and durable transcript failures without JSON pruning surprises
 - **High-quality summaries**: OpenAI generates structured summaries with TL;DR, key takeaways, and action items
 
 ## Privacy and Security
@@ -109,8 +109,17 @@ All settings can be configured in `.env`:
 - **YT_PER_CHANNEL_LIMIT**: Max videos per channel (default: 3, only for legacy method)
 - **YT_EXCLUDE_SHORTS**: Skip YouTube Shorts (default: true)
 - **YT_USE_EFFICIENT_API**: Use optimized API calls (default: true, **highly recommended**)
+- **YT_HISTORY_DB**: SQLite history database path (default: `yt_history.db`)
+- **YT_SUBSCRIPTION_HISTORY_RETENTION_DAYS**: How long subscription/URL successes suppress reprocessing (default: 365)
 - **OPENAI_API_KEY**: For high-quality structured summaries
 - **OUTPUT_DIR**: Where to save markdown files (default: ./ToJoplin)
+
+### History migration notes
+
+- On first run, legacy `yt_state.json` is imported into `yt_history.db` automatically.
+- Imported legacy entries are treated as **subscription-mode** history, which preserves backward compatibility without forcing playlist reprocessing.
+- Playlist successes are retained indefinitely by default; subscription and `--urls` successes use the long retention window from `YT_SUBSCRIPTION_HISTORY_RETENTION_DAYS`.
+- Permanent transcript failures are stored durably and skipped on future runs; temporary failures remain retryable.
 
 ### ⚠️ API Method Warning
 
@@ -133,7 +142,7 @@ All settings can be configured in `.env`:
 - **Age filter**: Set `YT_MAX_AGE_DAYS` to avoid summarizing ancient videos.
 - **Joplin**: Point Joplin's monitored folder at the same `OUTPUT_DIR`, or drop the folder into your Syncthing path (e.g. `Documents/ToJoplin`) so it imports automatically.
 - **OpenAI**: Generates structured summaries with TL;DR, key takeaways, and suggested follow-up actions.
-- **State tracking**: The script remembers processed videos in `yt_state.json` to avoid duplicates.
+- **History tracking**: The script now keeps durable per-mode history in `yt_history.db`. On first run it migrates legacy `yt_state.json` entries into SQLite and then relies on the database for filtering.
 
 ## Requirements
 
