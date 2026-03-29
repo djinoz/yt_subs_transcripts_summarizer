@@ -10,6 +10,10 @@ token.pickle
 
 # State and output files
 yt_state.json
+yt_state.json.*
+yt_history.db
+*.sqlite
+*.sqlite3
 ToJoplin/
 logs/
 *.log
