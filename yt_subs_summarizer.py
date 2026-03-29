@@ -104,7 +104,7 @@ try:
 except Exception:
     OpenAI = None
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/youtube"]
 
 def log_message(message: str, file=sys.stdout):
     """Prints a message to the specified file stream with a timestamp."""
@@ -216,10 +216,11 @@ def get_youtube_service() -> object:
             except google.auth.exceptions.RefreshError:
                 creds = None
         if not creds:
-            if not os.path.exists("client_secret.json"):
-                log_message("ERROR: Put your OAuth 'client_secret.json' in this folder.", file=sys.stderr)
+            client_secret_file = os.getenv("YT_CLIENT_SECRET_FILE", "client_secret.json")
+            if not os.path.exists(client_secret_file):
+                log_message(f"ERROR: Put your OAuth client secret file '{client_secret_file}' in this folder.", file=sys.stderr)
                 sys.exit(1)
-            flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(client_secret_file, SCOPES)
             creds = flow.run_local_server(port=0)
         with open(token_path, "wb") as f:
             pickle.dump(creds, f)
