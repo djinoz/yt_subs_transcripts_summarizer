@@ -78,6 +78,53 @@ python yt_subs_summarizer.py --dryrun --show-transcripts
 
 The first run will open a browser window to authorize read‑only access to your YouTube account. Summaries will land in `./ToJoplin` (or change `OUTPUT_DIR` in `.env`).
 
+## Operational reporting
+
+### End-of-run summary
+
+The normal run now ends with **counts-only** summary lines, designed to be cron/log friendly:
+
+- `Run summary:` candidates, filtered counts, selected, successes, and stage-group failure totals
+- `Failure breakdown:` request-blocked / transcripts-disabled / no-transcript / unavailable / private / generic transcript fetch
+
+These lines intentionally avoid listing video titles.
+
+### Ad hoc stats script
+
+Use `stats_report.py` to inspect history and operational counts over a time window without making network calls:
+
+```bash
+# All modes, human-readable
+python stats_report.py
+
+# Subscription-only, last 7 days, JSON
+python stats_report.py --mode subscription --since 2026-03-22T00:00:00 --json
+
+# Playlist-only with optional pie chart PNG (if matplotlib is installed)
+python stats_report.py --mode playlist --pie-chart reports/playlist_stats.png
+```
+
+Supported modes:
+- `subscription`
+- `playlist`
+- `urls`
+- `all`
+
+The script reports DB-backed counts for:
+- success
+- failed temporary
+- failed permanent
+- failed unknown
+
+It also derives operational counts from local logs where available:
+- shorts filtered
+- VPN failures
+- YouTube API failures / quota events
+- transcript fetch failures
+- summary/model/save failures
+
+Log-derived stage counts depend on the retained local log files and current log message patterns; the SQLite DB still stores only coarse success/temporary/permanent history.
+
 ## Troubleshooting
 
 ### YouTube API Quota Exhaustion

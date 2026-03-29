@@ -1110,9 +1110,35 @@ def main():
     # Shorts exclusion (all modes)
     # ALWAYS apply shorts filter when enabled, regardless of quota status
     # The exclude_shorts function will handle quota exhaustion gracefully
+    run_stats = {
+        "mode": history_mode,
+        "candidate_count": len(candidates),
+        "shorts_filtered": 0,
+        "filtered_already_processed": 0,
+        "filtered_watch_history": 0,
+        "filtered_previous_permanent_failures": 0,
+        "filtered_previous_temporary_failures_seen": 0,
+        "processing_selected": 0,
+        "success_saved": 0,
+        "vpn_failures": 0,
+        "yt_api_failures": 1 if QUOTA_EXHAUSTED else 0,
+        "transcript_fetch_failures": 0,
+        "summary_model_save_failures": 0,
+        "failure_breakdown": {
+            "request_blocked": 0,
+            "transcripts_disabled": 0,
+            "no_transcript_found": 0,
+            "video_unavailable_or_deleted": 0,
+            "video_private_or_restricted": 0,
+            "transcript_fetch_error": 0,
+            "other": 0,
+        },
+    }
+
     if cfg["EXCLUDE_SHORTS"] and candidates:
         before = len(candidates)
         candidates = exclude_shorts(youtube, candidates, cfg["SHORTS_MAX_SECONDS"], cfg["LOG_LEVEL"], args.dryrun)
+        run_stats["shorts_filtered"] += max(0, before - len(candidates))
         log_message(f"After Shorts filter: kept {len(candidates)}/{before}")
 
     # Unwatched proxy: remove already processed, permanently failed videos & (optionally) watched via Takeout
@@ -1132,9 +1158,11 @@ def main():
             entry = history.get_entry(vid, history_mode) or {}
             if reason == "permanent_failure":
                 error_categories["PERMANENT"] += 1
+                run_stats["filtered_previous_permanent_failures"] += 1
                 if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
                     log_message(f"[skip] previous error [PERMANENT] {entry.get('error_type')}: {v['channelTitle']} — {v['title']}", file=sys.stderr)
                 continue
+            run_stats["filtered_already_processed"] += 1
             if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
                 log_message(f"[skip] already processed ({history_mode}): {v['channelTitle']} — {v['title']}", file=sys.stderr)
             continue
@@ -1145,10 +1173,12 @@ def main():
                 error_categories["PERMANENT"] += 1
             elif entry.get("error_type"):
                 error_categories["TEMPORARY"] += 1
+                run_stats["filtered_previous_temporary_failures_seen"] += 1
             else:
                 error_categories["UNKNOWN"] += 1
 
         if takeout_ids and vid in takeout_ids:
+            run_stats["filtered_watch_history"] += 1
             if cfg["LOG_SKIPS"] and (args.dryrun or should_log_level("INFO", cfg["LOG_LEVEL"])):
                 log_message(f"[skip] in watch history: {v['channelTitle']} — {v['title']}", file=sys.stderr)
             continue
@@ -1163,6 +1193,7 @@ def main():
     if cfg["YT_MAX_VIDEOS"] > 0 and args.urls is None:
         candidates = candidates[:cfg["YT_MAX_VIDEOS"]]
     cap_info = cfg['YT_MAX_VIDEOS'] if args.urls is None else 'n/a (--urls)'
+    run_stats["processing_selected"] = len(candidates)
     log_message(f"Final selection count: {len(candidates)} (cap={cap_info})")
 
     if not candidates:
@@ -1258,6 +1289,22 @@ def main():
                 cause = error_type
             
             cause, error_kind = classify_transcript_failure(error_type, str(e))
+            run_stats["transcript_fetch_failures"] += 1
+            if cause == "RequestBlocked":
+                run_stats["vpn_failures"] += 1
+                run_stats["failure_breakdown"]["request_blocked"] += 1
+            elif cause == "TRANSCRIPTS_DISABLED":
+                run_stats["failure_breakdown"]["transcripts_disabled"] += 1
+            elif cause == "NO_TRANSCRIPT_FOUND":
+                run_stats["failure_breakdown"]["no_transcript_found"] += 1
+            elif cause == "VIDEO_UNAVAILABLE_OR_DELETED":
+                run_stats["failure_breakdown"]["video_unavailable_or_deleted"] += 1
+            elif cause == "VIDEO_PRIVATE_OR_RESTRICTED":
+                run_stats["failure_breakdown"]["video_private_or_restricted"] += 1
+            elif cause == "TRANSCRIPT_FETCH_ERROR":
+                run_stats["failure_breakdown"]["transcript_fetch_error"] += 1
+            else:
+                run_stats["failure_breakdown"]["other"] += 1
             if not args.skip_state:
                 history.record_failure(
                     vid,
@@ -1301,6 +1348,7 @@ def main():
                 summary_block = summarize_local_textrank(info["text"], sentences=6)
             save_markdown(out_dir, v, info, summary_block, youtube)
             saved += 1
+            run_stats["success_saved"] += 1
             if not args.skip_state:
                 history.record_success(
                     vid,
@@ -1309,19 +1357,44 @@ def main():
                     channel=v.get("videoOwnerChannelTitle", v.get("channelTitle")),
                 )
         except Exception as e:
+            run_stats["summary_model_save_failures"] += 1
             log_message(f"[warn] failed to save/mark {vid}: {e}", file=sys.stderr)
 
         human_pause(cfg)
 
     
-    # Final summary message
+    # Final summary message (counts only; suitable for cron/report usage)
     if QUOTA_EXHAUSTED:
-        log_message(f"✓ Completed processing despite YouTube API quota exhaustion.")
-        log_message(f"  Processed {saved} videos that were retrieved before quota limit.")
-        log_message(f"  Markdown files saved to: {out_dir.resolve()}")
-        log_message(f"  Script will retry remaining videos on next scheduled run (quota resets daily).")
+        run_stats["yt_api_failures"] = max(run_stats["yt_api_failures"], 1)
+        log_message("✓ Completed processing despite YouTube API quota exhaustion.")
     else:
-        log_message(f"Done. Markdown files saved to: {out_dir.resolve()} (wrote {saved} files)")
+        log_message("Done.")
+    log_message(
+        "Run summary: "
+        f"mode={run_stats['mode']}; candidates={run_stats['candidate_count']}; "
+        f"shorts_filtered={run_stats['shorts_filtered']}; "
+        f"filtered_already_processed={run_stats['filtered_already_processed']}; "
+        f"filtered_watch_history={run_stats['filtered_watch_history']}; "
+        f"filtered_previous_permanent_failures={run_stats['filtered_previous_permanent_failures']}; "
+        f"previous_temporary_failures_seen={run_stats['filtered_previous_temporary_failures_seen']}; "
+        f"selected={run_stats['processing_selected']}; success_saved={run_stats['success_saved']}; "
+        f"vpn_failures={run_stats['vpn_failures']}; yt_api_failures={run_stats['yt_api_failures']}; "
+        f"transcript_fetch_failures={run_stats['transcript_fetch_failures']}; "
+        f"summary_model_save_failures={run_stats['summary_model_save_failures']}"
+    )
+    log_message(
+        "Failure breakdown: "
+        f"request_blocked={run_stats['failure_breakdown']['request_blocked']}; "
+        f"transcripts_disabled={run_stats['failure_breakdown']['transcripts_disabled']}; "
+        f"no_transcript_found={run_stats['failure_breakdown']['no_transcript_found']}; "
+        f"video_unavailable_or_deleted={run_stats['failure_breakdown']['video_unavailable_or_deleted']}; "
+        f"video_private_or_restricted={run_stats['failure_breakdown']['video_private_or_restricted']}; "
+        f"transcript_fetch_error={run_stats['failure_breakdown']['transcript_fetch_error']}; "
+        f"other={run_stats['failure_breakdown']['other']}"
+    )
+    log_message(f"Markdown files saved to: {out_dir.resolve()}")
+    if QUOTA_EXHAUSTED:
+        log_message("Script will retry remaining videos on next scheduled run (quota resets daily).")
 
 if __name__ == "__main__":
     main()
