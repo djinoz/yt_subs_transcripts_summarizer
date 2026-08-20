@@ -25,6 +25,7 @@ Fetch transcripts for the **latest videos from channels you're subscribed to** a
 - **Quota exhaustion handling**: Gracefully processes any retrieved videos even if API quota is exceeded
 - **IP blocking protection**: Graceful error handling with helpful troubleshooting messages
 - **Durable history tracking**: SQLite-backed history remembers processed videos and durable transcript failures without JSON pruning surprises
+- **Single-run overlap protection**: lock file prevents concurrent runs in the same mode from reprocessing the same videos
 - **High-quality summaries**: OpenAI generates structured summaries with TL;DR, key takeaways, and action items
 
 ## Privacy and Security
@@ -153,11 +154,12 @@ All settings can be configured in `.env`:
 
 - **YT_MAX_VIDEOS**: Maximum videos to process per run (default: 30)
 - **YT_MAX_AGE_DAYS**: Only process videos newer than this (default: 14 days) 
-- **YT_PER_CHANNEL_LIMIT**: Max videos per channel (default: 3, only for legacy method)
+- **YT_PER_CHANNEL_LIMIT**: Max videos per channel (default: 3, applies to uploads-playlist scanning and legacy method)
 - **YT_EXCLUDE_SHORTS**: Skip YouTube Shorts (default: true)
-- **YT_USE_EFFICIENT_API**: Use optimized API calls (default: true, **highly recommended**)
+- **YT_USE_EFFICIENT_API**: Use uploads-playlist scanning instead of search.list (default: true, **highly recommended**)
 - **YT_HISTORY_DB**: SQLite history database path (default: `yt_history.db`)
 - **YT_SUBSCRIPTION_HISTORY_RETENTION_DAYS**: How long subscription/URL successes suppress reprocessing (default: 365)
+- **YT_RUN_LOCK_FILE**: pidfile used to block overlapping runs in the same mode (default: `.yt_subs_summarizer.lock`)
 - **OPENAI_API_KEY**: For high-quality structured summaries
 - **OUTPUT_DIR**: Where to save markdown files (default: ./ToJoplin)
 
@@ -190,6 +192,7 @@ All settings can be configured in `.env`:
 - **Joplin**: Point Joplin's monitored folder at the same `OUTPUT_DIR`, or drop the folder into your Syncthing path (e.g. `Documents/ToJoplin`) so it imports automatically.
 - **OpenAI**: Generates structured summaries with TL;DR, key takeaways, and suggested follow-up actions.
 - **History tracking**: The script now keeps durable per-mode history in `yt_history.db`. On first run it migrates legacy `yt_state.json` entries into SQLite and then relies on the database for filtering.
+- **Overlap protection**: If another run in the same mode is already active, the script exits early instead of racing and creating duplicate summaries. Stale lock files are automatically cleaned up when the owning PID is gone.
 
 ## Requirements
 

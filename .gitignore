@@ -12,11 +12,16 @@ token.pickle
 yt_state.json
 yt_state.json.*
 yt_history.db
+history.db
 *.sqlite
 *.sqlite3
 ToJoplin/
 logs/
 *.log
+playlist_stats_30d.png
+runvpn
+cookies.txt
+tmp/
 
 # LaunchAgent configuration (contains user-specific paths)
 com.youtube.summarizer.plist

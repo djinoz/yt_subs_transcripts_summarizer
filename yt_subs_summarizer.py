@@ -17,7 +17,7 @@
 #   YT_SHORTS_MAX_SECONDS=180
 #   YT_STATE_FILE=yt_state.json
 #   YT_HISTORY_DB=yt_history.db
-#   YT_USE_EFFICIENT_API=1              # use efficient API (default, recommended)
+#   YT_USE_EFFICIENT_API=1              # use uploads-playlist scan (default, recommended)
 #   YT_TAKEOUT_WATCH_JSON=
 #   YT_COOKIES_FILE=~/youtube_cookies.txt   # cookies (Netscape) for gated captions
 #   HTTP_PROXY=
@@ -39,6 +39,10 @@ import pathlib
 import datetime as dt
 import time
 import random
+import atexit
+import signal
+import urllib.parse
+import urllib.request
 from typing import List, Dict, Optional, Tuple, Set
 
 from history_db import (
@@ -147,9 +151,10 @@ def load_config(args=None):
         "HTTP_PROXY": os.getenv("HTTP_PROXY", "").strip() or None,
         "HTTPS_PROXY": os.getenv("HTTPS_PROXY", "").strip() or None,
         "USE_EFFICIENT_API": os.getenv("YT_USE_EFFICIENT_API", "1").strip() not in ("0", "false", "False"),
-        "FETCH_DELAY_MIN": float(os.getenv("YT_FETCH_DELAY_MIN", "1.5")),
-        "FETCH_DELAY_MAX": float(os.getenv("YT_FETCH_DELAY_MAX", "4.0")),
-        "REQUESTBLOCKED_RETRIES": int(os.getenv("YT_REQUESTBLOCKED_RETRIES", "2")),
+        "FETCH_DELAY_MIN": float(os.getenv("YT_FETCH_DELAY_MIN", "4.0")),
+        "FETCH_DELAY_MAX": float(os.getenv("YT_FETCH_DELAY_MAX", "8.0")),
+        "REQUESTBLOCKED_RETRIES": int(os.getenv("YT_REQUESTBLOCKED_RETRIES", "5")),
+        "RUN_LOCK_FILE": os.getenv("YT_RUN_LOCK_FILE", ".yt_subs_summarizer.lock"),
     }
     
     # Apply command-line overrides if provided
@@ -171,6 +176,69 @@ def get_history_mode(args) -> str:
     if args.urls is not None:
         return MODE_URLS
     return MODE_SUBSCRIPTION
+
+
+def acquire_run_lock(lock_path: str):
+    """Acquire an exclusive single-run lock using a pidfile pattern."""
+    lock_file = pathlib.Path(lock_path)
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+
+    while True:
+        try:
+            fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            payload = {
+                "pid": os.getpid(),
+                "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "argv": sys.argv,
+            }
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            break
+        except FileExistsError:
+            stale_pid = None
+            try:
+                existing = json.loads(lock_file.read_text(encoding="utf-8") or "{}")
+                stale_pid = int(existing.get("pid")) if existing.get("pid") is not None else None
+            except Exception:
+                stale_pid = None
+
+            if stale_pid:
+                try:
+                    os.kill(stale_pid, 0)
+                    raise SystemExit(
+                        f"Another summarizer run is already active (pid={stale_pid}, lock={lock_file}). Aborting to avoid duplicate processing."
+                    )
+                except OSError:
+                    log_message(f"[warn] Removing stale lock file: {lock_file}", file=sys.stderr)
+                    try:
+                        lock_file.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+
+            raise SystemExit(
+                f"Summarizer lock exists but could not be validated ({lock_file}). Remove it if no run is active."
+            )
+
+    def _cleanup_lock(*_args):
+        try:
+            if lock_file.exists():
+                current = json.loads(lock_file.read_text(encoding="utf-8") or "{}")
+                if int(current.get("pid", -1)) == os.getpid():
+                    lock_file.unlink()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup_lock)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous = signal.getsignal(sig)
+        def _handler(signum, frame, _previous=previous):
+            _cleanup_lock()
+            if callable(_previous):
+                _previous(signum, frame)
+            raise SystemExit(128 + signum)
+        signal.signal(sig, _handler)
+    return lock_file
 
 _YT_URL_RE = re.compile(r"(?:v=|youtu\.be/)([A-Za-z0-9_\-]{11})")
 _YT_ID_RE  = re.compile(r"^[A-Za-z0-9_\-]{11}$")
@@ -427,115 +495,116 @@ def exclude_shorts(youtube, videos: List[Dict], max_seconds: int, log_level: str
 
 # ------------------ Efficient Subscription API ------------------
 
-def get_recent_subscription_videos_efficient(youtube, max_videos: int, max_age_days: int) -> List[Dict]:
-    """
-    Efficiently get recent videos from subscriptions using a hybrid approach:
-    1. Get a sample of most relevant subscription channels (~1 API call)
-    2. Use search API to get recent videos from those channels (~20 API calls)
-    
-    Total: ~21 API calls instead of 200+ with the old method!
-    Retrieves extra videos to account for heavy filtering (Shorts, already processed, etc.)
-    """
-    # Get a sample of subscribed channels (increased to get more candidates for filtering)
-    channels = []
-    subs_req = youtube.subscriptions().list(
-        part="snippet",
-        mine=True,
-        maxResults=20,  # Increased from 8 to get more channels and survive filtering
-        order="relevance"  # Get most relevant channels
-    )
-    
-    resp = _execute_with_backoff(subs_req, "subscriptions.list:sample")
-    if not resp:
-        return []
-        
-    for item in resp.get("items", []):
-        try:
-            channel_id = item["snippet"]["resourceId"]["channelId"]
-            channel_title = item["snippet"]["title"]
-            channels.append({"id": channel_id, "title": channel_title})
-        except KeyError:
-            continue
-    
-    log_message(f"Searching recent videos from {len(channels)} most active subscribed channels…")
-    
-    # Now use search API to get recent videos from these channels
-    cutoff = dt.datetime.now().astimezone() - dt.timedelta(days=max_age_days) if max_age_days > 0 else None
-    videos = []
-    
-    for channel in channels[:20]:  # Increased from 10 to process more channels
-        if len(videos) >= max_videos:
-            break
-            
-        search_req = youtube.search().list(
-            part="snippet",
-            channelId=channel["id"],
-            type="video",
-            order="date",
-            maxResults=min(15, max_videos // 15 + 5),  # Increased from 5 to get more videos per channel
-            publishedAfter=(cutoff.isoformat() if cutoff else None)
-        )
-        
-        resp = _execute_with_backoff(search_req, f"search.list:{channel['title']}")
-        if not resp:
-            continue
-            
-        for item in resp.get("items", []):
-            if len(videos) >= max_videos:
-                break
-                
-            try:
-                videos.append({
-                    "videoId": item["id"]["videoId"],
-                    "publishedAt": item["snippet"]["publishedAt"],
-                    "title": item["snippet"]["title"],
-                    "channelTitle": item["snippet"]["channelTitle"],
-                    "videoOwnerChannelTitle": item["snippet"]["channelTitle"],  # Same as channelTitle for subscription videos
-                })
-            except KeyError:
-                continue
-    
-    return videos
-
-# ------------------ Listing + Filters ------------------
-
-def iter_recent_from_uploads(youtube, uploads_info: List[Dict], per_channel_max_age_days: int, per_channel_limit: int, dryrun: bool=False) -> List[Dict]:
-    """First page per uploads playlist; per-channel age filter & cap."""
+def _iter_uploads_playlist_candidates(
+    youtube,
+    playlist_id: str,
+    channel_title: str,
+    per_channel_limit: int,
+    max_age_days: int,
+) -> List[Dict]:
+    """Walk an uploads playlist newest-first, stopping at the age window."""
     cutoff = None
-    if per_channel_max_age_days and per_channel_max_age_days > 0:
-        cutoff = dt.datetime.now().astimezone() - dt.timedelta(days=per_channel_max_age_days)
-    videos: List[Dict] = []
-    for entry in tqdm(uploads_info, desc="Scanning subscriptions"):
-        pid = entry["playlist_id"]; channel_title = entry["channel_title"]
-        # Pull a small buffer above the cap to survive later filters
-        page_size = min(50, max(5, per_channel_limit * 3))
-        req = youtube.playlistItems().list(part="snippet,contentDetails", playlistId=pid, maxResults=page_size)
+    if max_age_days and max_age_days > 0:
+        cutoff = dt.datetime.now().astimezone() - dt.timedelta(days=max_age_days)
+
+    out: List[Dict] = []
+    page_size = min(50, max(5, per_channel_limit * 3))
+    req = youtube.playlistItems().list(
+        part="snippet,contentDetails",
+        playlistId=playlist_id,
+        maxResults=page_size,
+    )
+
+    while req and len(out) < per_channel_limit:
         resp = _execute_with_backoff(req, f"playlistItems.list:{channel_title}")
         if not resp:
-            continue
-        got = 0
+            break
+
+        hit_cutoff = False
         for item in resp.get("items", []):
             try:
                 published_at = iso_to_dt(item["contentDetails"]["videoPublishedAt"]).astimezone()
             except Exception:
                 continue
             if cutoff and published_at < cutoff:
-                continue
+                hit_cutoff = True
+                break
             try:
-                videos.append({
+                out.append({
                     "videoId": item["contentDetails"]["videoId"],
                     "publishedAt": item["contentDetails"]["videoPublishedAt"],
                     "title": item["snippet"]["title"],
                     "channelTitle": channel_title,
-                    "videoOwnerChannelTitle": channel_title,  # Same as channelTitle for subscription videos
+                    "videoOwnerChannelTitle": item["snippet"].get("videoOwnerChannelTitle", channel_title),
                 })
-                got += 1
-                if got >= per_channel_limit:
-                    break
             except Exception:
                 continue
-        if dryrun and got == 0:
+            if len(out) >= per_channel_limit:
+                break
+
+        if len(out) >= per_channel_limit or hit_cutoff:
+            break
+        req = youtube.playlistItems().list_next(req, resp)
+
+    return out
+
+
+def get_recent_subscription_videos_efficient(
+    youtube,
+    max_videos: int,
+    max_age_days: int,
+    per_channel_limit: int,
+) -> List[Dict]:
+    """
+    Efficiently get recent videos from subscriptions via uploads playlists.
+
+    This avoids `search.list` in the hot path, which is the quota bottleneck.
+    We fetch the latest few uploads per subscribed channel, bounded by the
+    configured age window, then let the downstream shorts/history filters do
+    the final trimming.
+    """
+    uploads = get_subscribed_upload_playlists(youtube)
+    if not uploads:
+        return []
+
+    per_channel_limit = max(1, int(per_channel_limit or 3))
+    log_message(
+        f"Scanning {len(uploads)} subscribed channels via uploads playlists "
+        f"(age window: {max_age_days}d, per-channel cap: {per_channel_limit})…"
+    )
+
+    videos: List[Dict] = []
+    for channel in tqdm(uploads, desc="Scanning subscriptions"):
+        if len(videos) >= max_videos:
+            break
+        channel_videos = _iter_uploads_playlist_candidates(
+            youtube,
+            channel["playlist_id"],
+            channel["channel_title"],
+            per_channel_limit=per_channel_limit,
+            max_age_days=max_age_days,
+        )
+        videos.extend(channel_videos)
+
+    return videos[:max_videos]
+
+# ------------------ Listing + Filters ------------------
+
+def iter_recent_from_uploads(youtube, uploads_info: List[Dict], per_channel_max_age_days: int, per_channel_limit: int, dryrun: bool=False) -> List[Dict]:
+    """Backward-compatible wrapper for uploads-playlist scanning."""
+    videos: List[Dict] = []
+    for entry in tqdm(uploads_info, desc="Scanning subscriptions"):
+        channel_title = entry["channel_title"]
+        channel_videos = _iter_uploads_playlist_candidates(
+            youtube,
+            entry["playlist_id"],
+            channel_title,
+            per_channel_limit=per_channel_limit,
+            max_age_days=per_channel_max_age_days,
+        )
+        if dryrun and not channel_videos:
             log_message(f"[info] No recent items for channel: {channel_title}")
+        videos.extend(channel_videos)
     return videos
 
 def list_videos_from_playlist_id(youtube, playlist_id: str, max_age_days: int) -> Tuple[List[Dict], str]:
@@ -856,22 +925,125 @@ def summarize_local_textrank(text: str, sentences: int = 5) -> str:
     except Exception:
         return (text[:800] + "…") if len(text) > 800 else text
 
-def summarize_openai(text: str, api_key: str, model: str = "gpt-4o-mini") -> str:
+_OPENAI_MODEL_CANDIDATE_CACHE: Dict[Tuple[Optional[str], str], List[str]] = {}
+
+
+def _normalize_model_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (value or "").strip().lower()).strip("-")
+
+
+def _list_openai_model_ids(client) -> List[str]:
+    data = client.models.list()
+    return [getattr(item, "id", "") for item in getattr(data, "data", []) if getattr(item, "id", "")]
+
+
+def _candidate_model_ids(client, requested_model: str, base_url: Optional[str] = None) -> List[str]:
+    cache_key = ((base_url or "").rstrip("/") or None, requested_model)
+    cached = _OPENAI_MODEL_CANDIDATE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    requested = (requested_model or "").strip()
+    requested_norm = _normalize_model_name(requested)
+    requested_tokens = [tok for tok in requested_norm.split("-") if tok]
+
+    try:
+        available = _list_openai_model_ids(client)
+    except Exception:
+        available = []
+
+    if not available:
+        result = [requested]
+        _OPENAI_MODEL_CANDIDATE_CACHE[cache_key] = result
+        return result
+
+    exact = [mid for mid in available if mid == requested]
+
+    def score(model_id: str) -> Tuple[int, int, int, int]:
+        norm = _normalize_model_name(model_id)
+        basename = _normalize_model_name(model_id.split("/")[-1])
+        overlap = sum(1 for tok in requested_tokens if tok in norm)
+        all_tokens = int(bool(requested_tokens) and all(tok in norm for tok in requested_tokens))
+        contains_query = int(bool(requested_norm) and requested_norm in norm)
+        basename_exact = int(bool(requested_norm) and requested_norm == basename)
+        mlx_bonus = int("mlx" in norm and "gemma" in requested_norm)
+        instruct_bonus = int(norm.endswith("-it") or "instruct" in norm)
+        return (
+            contains_query,
+            basename_exact + all_tokens,
+            overlap + mlx_bonus + instruct_bonus,
+            -len(model_id),
+        )
+
+    fuzzy = sorted(
+        [mid for mid in available if mid not in exact and any(tok in _normalize_model_name(mid) for tok in requested_tokens)],
+        key=score,
+        reverse=True,
+    )
+    result = exact + fuzzy
+    if requested not in result:
+        result.append(requested)
+    _OPENAI_MODEL_CANDIDATE_CACHE[cache_key] = result
+    return result
+
+
+def _is_model_resolution_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        ("model" in msg and "not found" in msg)
+        or "failed to load model" in msg
+        or "unknown model" in msg
+        or "does not exist" in msg
+        or "invalid model" in msg
+    )
+
+
+def summarize_openai(text: str, api_key: str, model: str = "gpt-4o-mini", base_url: Optional[str] = None) -> Tuple[str, str]:
     if not OpenAI:
         raise RuntimeError("openai package not available")
-    client = OpenAI(api_key=api_key)
-    content = [
-        {"type": "text", "text": OPENAI_SUMMARY_PROMPT},
-        {"type": "text", "text": text[:150000]}
-    ]
-    resp = client.chat.completions.create(
-        model=model, 
-        messages=[{"role": "user", "content": content}], 
-        temperature=0.2
-    )
-    return resp.choices[0].message.content.strip()
+    client_kwargs = {"api_key": api_key}
+    if base_url:
+        client_kwargs["base_url"] = base_url.rstrip("/")
+    client = OpenAI(**client_kwargs)
 
-def summarize_ollama(text: str, model: str = "qwen2.5:14b", base_url: str = "http://localhost:11434") -> str:
+    def _is_context_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return (
+            "context length" in msg
+            or "n_keep" in msg
+            or "n_ctx" in msg
+            or "maximum context" in msg
+            or "too many tokens" in msg
+        )
+
+    model_candidates = _candidate_model_ids(client, model, base_url)
+
+    # Cloud models can take far more input than the local Gemma OpenAI-compatible path.
+    # Retry with progressively shorter transcript slices if the backend rejects the prompt.
+    candidate_limits = [150000, 24000, 12000, 8000, 4000]
+    last_exc = None
+    for model_name in model_candidates:
+        if model_name != model:
+            log_message(f"[model] requested={model} resolved={model_name}")
+        for limit in candidate_limits:
+            try:
+                prompt_text = f"{OPENAI_SUMMARY_PROMPT}\n\n{text[:limit]}"
+                resp = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt_text}],
+                    temperature=0.2
+                )
+                return (resp.choices[0].message.content or "").strip(), model_name
+            except Exception as e:
+                last_exc = e
+                if _is_context_error(e) and limit != candidate_limits[-1]:
+                    continue
+                if _is_model_resolution_error(e):
+                    break
+                raise
+    raise RuntimeError(f"OpenAI-compatible summarization failed after retries: {last_exc}")
+
+def summarize_ollama(text: str, model: str = "qwen2.5:14b", base_url: str = "http://localhost:11434") -> Tuple[str, str]:
     """Summarize using local Ollama model."""
     import json
     import urllib.request
@@ -898,16 +1070,142 @@ def summarize_ollama(text: str, model: str = "qwen2.5:14b", base_url: str = "htt
     try:
         with urllib.request.urlopen(req, timeout=300) as response:
             result = json.loads(response.read())
-            return result.get('response', '').strip()
+            return result.get('response', '').strip(), model
     except Exception as e:
         raise RuntimeError(f"Ollama API call failed: {e}")
 
-def save_markdown(out_dir: pathlib.Path, video: Dict, transcript_info: Dict[str, str], summary_block: str, youtube=None):
+def _joplin_api_enabled() -> bool:
+    return os.getenv("JOPLIN_DIRECT_IMPORT", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _joplin_tag_titles() -> List[str]:
+    raw = os.getenv("JOPLIN_IMPORT_TAGS", "")
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _joplin_request(method: str, path: str, payload: Optional[Dict] = None) -> Dict:
+    base_url = os.getenv("JOPLIN_API_URL", "http://127.0.0.1:41184").rstrip("/")
+    token = os.getenv("JOPLIN_API_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("JOPLIN_API_TOKEN is required when JOPLIN_DIRECT_IMPORT is enabled")
+
+    url = f"{base_url}{path}"
+    sep = "&" if "?" in url else "?"
+    url = f"{url}{sep}token={urllib.parse.quote(token)}"
+    body = None
+    headers = {}
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=30) as response:
+        raw = response.read().decode("utf-8")
+    return json.loads(raw) if raw else {}
+
+
+def _joplin_find_existing_note(video: Dict, note_title: str, folder_id: str) -> Optional[Dict]:
+    video_id = str(video.get("videoId", "")).strip()
+    page = 1
+    candidates: List[Dict] = []
+
+    while True:
+        note_page = _joplin_request(
+            "GET",
+            f"/folders/{folder_id}/notes?fields=id,title,parent_id,source_application&limit=100&page={page}",
+        )
+        items = note_page.get("items", [])
+        candidates.extend(items)
+        if not note_page.get("has_more"):
+            break
+        page += 1
+
+    for item in candidates:
+        note_id = item.get("id")
+        if not note_id:
+            continue
+        if item.get("title") != note_title and not video_id:
+            continue
+        full = _joplin_request("GET", f"/notes/{note_id}?fields=id,title,parent_id,body,source_application")
+        body = full.get("body") or ""
+        if video_id and f'video_id: "{video_id}"' in body:
+            return full
+        if full.get("title") == note_title and full.get("source_application") == "yt_subs_transcripts_summarizer":
+            return full
+
+    return None
+
+
+def save_joplin_note(video: Dict, md: str, note_title: str) -> str:
+    folder_id = os.getenv("JOPLIN_IMPORT_FOLDER_ID", "").strip()
+    if not folder_id:
+        raise RuntimeError("JOPLIN_IMPORT_FOLDER_ID is required when JOPLIN_DIRECT_IMPORT is enabled")
+
+    note_payload = {
+        "title": note_title,
+        "body": md,
+        "parent_id": folder_id,
+        "is_todo": 1 if os.getenv("JOPLIN_IMPORT_IS_TODO", "1").strip().lower() in ("1", "true", "yes", "on") else 0,
+        "source": "joplin",
+        "source_application": "yt_subs_transcripts_summarizer",
+    }
+
+    existing = _joplin_find_existing_note(video, note_title, folder_id)
+    if existing and existing.get("id"):
+        note_id = existing["id"]
+        _joplin_request("PUT", f"/notes/{note_id}", note_payload)
+    else:
+        created = _joplin_request("POST", "/notes", note_payload)
+        note_id = created.get("id")
+        if not note_id:
+            raise RuntimeError(f"Joplin API did not return a note id for title: {note_title}")
+
+    all_tags: List[Dict] = []
+    page = 1
+    while True:
+        tag_page = _joplin_request("GET", f"/tags?fields=id,title&limit=100&page={page}")
+        all_tags.extend(tag_page.get("items", []))
+        if not tag_page.get("has_more"):
+            break
+        page += 1
+    tag_ids_by_title = {tag.get("title"): tag.get("id") for tag in all_tags if tag.get("id")}
+
+    note_tags = _joplin_request("GET", f"/notes/{note_id}/tags?fields=id,title")
+    note_tag_titles = {tag.get("title") for tag in note_tags.get("items", [])}
+
+    for tag_title in _joplin_tag_titles():
+        tag_id = tag_ids_by_title.get(tag_title)
+        if not tag_id:
+            tag = _joplin_request("POST", "/tags", {"title": tag_title})
+            tag_id = tag.get("id")
+            if not tag_id:
+                raise RuntimeError(f"Joplin API did not return a tag id for tag: {tag_title}")
+            tag_ids_by_title[tag_title] = tag_id
+        if tag_title not in note_tag_titles:
+            _joplin_request("POST", f"/tags/{tag_id}/notes", {"id": note_id})
+
+    read_back = _joplin_request("GET", f"/notes/{note_id}?fields=id,title,parent_id,is_todo,body")
+    if read_back.get("title") != note_title or read_back.get("parent_id") != folder_id:
+        raise RuntimeError(f"Joplin note read-back verification failed for note {note_id}")
+    if not (read_back.get("body") or "").startswith(f"# {html.unescape(video['title'])}"):
+        raise RuntimeError(f"Joplin note body verification failed for note {note_id}")
+    return note_id
+
+
+def save_markdown(
+    out_dir: pathlib.Path,
+    video: Dict,
+    transcript_info: Dict[str, str],
+    summary_block: str,
+    summary_model: str,
+    youtube=None,
+):
     out_dir.mkdir(parents=True, exist_ok=True)
     published = iso_to_dt(video["publishedAt"]).astimezone().strftime("%Y-%m-%d")
     # Decode HTML entities first, then clean for filesystem
     clean_title = html.unescape(video["title"])
     safe_title = "".join(c for c in clean_title if c not in r'\/:*?"<>|').strip()
+    note_title = f"{clean_title} - {published}"
     # New filename format: TITLE - DATE
     path = out_dir / f"{safe_title} - {published}.md"
     url = f"https://www.youtube.com/watch?v={video['videoId']}"
@@ -939,7 +1237,8 @@ def save_markdown(out_dir: pathlib.Path, video: Dict, transcript_info: Dict[str,
 **Channel:** {html.unescape(display_channel)}  
 **Duration:** {duration_display}  
 **Published:** {video['publishedAt']}  
-**Link:** {url}
+**Link:** {url}  
+**Summary model:** {summary_model}
 
 ## Summary
 {summary_block}
@@ -952,12 +1251,16 @@ published_at: "{video['publishedAt']}"
 source_url: "{url}"
 transcript_language: "{lang}"
 transcript_translated: {str(bool(translated)).lower()}
+summary_model: "{summary_model}"
 ---
 
 ## Transcript
 
 {transcript_info['text']}
 """
+    if _joplin_api_enabled():
+        note_id = save_joplin_note(video, md, note_title)
+        return f"joplin:{note_id}"
     path.write_text(md, encoding="utf-8")
     return str(path)
 
@@ -982,6 +1285,16 @@ def main():
     use_ollama = cfg["USE_OLLAMA"]
     use_openai = bool(cfg["OPENAI_API_KEY"]) and not use_ollama
 
+    history_mode = get_history_mode(args)
+    lock_path = cfg["RUN_LOCK_FILE"]
+    if history_mode == MODE_PLAYLIST:
+        lock_path = f"{lock_path}.playlist"
+    elif history_mode == MODE_URLS:
+        lock_path = f"{lock_path}.urls"
+    acquired_lock = acquire_run_lock(lock_path)
+    if should_log_level("INFO", cfg["LOG_LEVEL"]):
+        log_message(f"[lock] acquired {acquired_lock}")
+
     # proxies map for youtube_transcript_api (and requests fallback)
     proxies = {}
     if cfg.get("HTTP_PROXY"): proxies["http"] = cfg["HTTP_PROXY"]
@@ -991,7 +1304,6 @@ def main():
 
     # Durable history + optional watch-history
     state_file = cfg["STATE_FILE"]
-    history_mode = get_history_mode(args)
     history = HistoryDB(cfg["HISTORY_DB"], state_file=state_file)
     history.prune_successes(MODE_SUBSCRIPTION, cfg["SUBSCRIPTION_HISTORY_RETENTION_DAYS"])
     history.prune_successes(MODE_URLS, cfg["SUBSCRIPTION_HISTORY_RETENTION_DAYS"])
@@ -1057,11 +1369,12 @@ def main():
         if cfg["USE_EFFICIENT_API"]:
             log_message("Fetching recent videos from subscriptions (efficient API)…")
             try:
-                # Use the efficient search-based approach
+                # Use the uploads-playlist scan approach
                 candidates = get_recent_subscription_videos_efficient(
-                    youtube, 
+                    youtube,
                     max_videos=cfg["YT_MAX_VIDEOS"] * 10,  # Get 10x to survive heavy filtering (Shorts + already processed)
-                    max_age_days=cfg["YT_MAX_AGE_DAYS"]
+                    max_age_days=cfg["YT_MAX_AGE_DAYS"],
+                    per_channel_limit=cfg["YT_PER_CHANNEL_LIMIT"],
                 )
                 human_context = "Subscriptions (Efficient API)"
                 log_message(f"Candidates from efficient API: {len(candidates)}")
@@ -1243,12 +1556,23 @@ def main():
 
     log_message(f"Processing {len(candidates)} videos…")
     saved = 0
-    for v in tqdm(candidates, desc="Summarizing"):
+    for idx, v in enumerate(tqdm(candidates, desc="Summarizing"), start=1):
         vid = v["videoId"]
+        video_label = f"{v.get('channelTitle', '?')} — {v.get('title', vid)}"
+        video_started_at = time.perf_counter()
+        if should_log_level("INFO", cfg["LOG_LEVEL"]):
+            log_message(f"[video-start] {idx}/{len(candidates)} {vid} | {video_label}")
         try:
             info = None
             attempts = max(1, int(cfg.get("REQUESTBLOCKED_RETRIES", 2)) + 1)
+            transcript_started_at = time.perf_counter()
             for attempt in range(1, attempts + 1):
+                try:
+                    current_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+                except Exception:
+                    current_ip = "Unknown"
+                if should_log_level("INFO", cfg["LOG_LEVEL"]):
+                    log_message(f"[net] pre-transcript fetch ip={current_ip} video={vid} attempt={attempt}/{attempts}")
                 try:
                     info = fetch_transcript_any_lang(
                         vid,
@@ -1259,14 +1583,28 @@ def main():
                         cookies_path=cfg["COOKIES_FILE"],
                         proxies=proxies,
                     )
+                    if should_log_level("INFO", cfg["LOG_LEVEL"]):
+                        transcript_elapsed = time.perf_counter() - transcript_started_at
+                        transcript_chars = len(info.get("text", "")) if info else 0
+                        transcript_lang = info.get("lang", "unknown") if info else "unknown"
+                        log_message(
+                            f"[stage] transcript_ready video={vid} elapsed={transcript_elapsed:.2f}s chars={transcript_chars} lang={transcript_lang}"
+                        )
                     break
                 except Exception as e:
-                    if is_request_blocked_error(e) and attempt < attempts:
-                        backoff = 4 * attempt + random.uniform(0.5, 2.0)
+                    if is_request_blocked_error(e):
+                        try:
+                            blocked_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()
+                        except Exception:
+                            blocked_ip = "Unknown"
                         if should_log_level("WARN", cfg["LOG_LEVEL"]):
-                            log_message(f"[retry] transcript blocked for {vid}, attempt {attempt}/{attempts}, sleeping {backoff:.1f}s", file=sys.stderr)
-                        time.sleep(backoff)
-                        continue
+                            log_message(f"[retry] transcript blocked for {vid}, attempt {attempt}/{attempts}, ip={blocked_ip}, err={type(e).__name__}: {e}", file=sys.stderr)
+                        if attempt < attempts:
+                            backoff = 8 * attempt + random.uniform(1.0, 4.0)
+                            if should_log_level("WARN", cfg["LOG_LEVEL"]):
+                                log_message(f"[retry] sleeping {backoff:.1f}s before next attempt for {vid}", file=sys.stderr)
+                            time.sleep(backoff)
+                            continue
                     raise
         except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript) as e:
             # Diagnose the root cause to avoid retrying permanently-failed videos
@@ -1329,24 +1667,46 @@ def main():
                     title=v.get("title"),
                     channel=v.get("videoOwnerChannelTitle", v.get("channelTitle")),
                 )
+            if should_log_level("INFO", cfg["LOG_LEVEL"]):
+                total_elapsed = time.perf_counter() - video_started_at
+                log_message(f"[video-done] {vid} outcome=no_transcript total_elapsed={total_elapsed:.2f}s")
             human_pause(cfg)
             continue
         try:
+            summary_backend = "ollama" if use_ollama else ("openai-compatible" if use_openai else "textrank")
+            summary_model_used = "textrank"
+            summary_started_at = time.perf_counter()
+            if should_log_level("INFO", cfg["LOG_LEVEL"]):
+                log_message(f"[stage] summary_start video={vid} backend={summary_backend} transcript_chars={len(info['text'])}")
             if use_ollama:
-                summary_block = summarize_ollama(
+                summary_block, summary_model_used = summarize_ollama(
                     info["text"],
                     cfg["OLLAMA_MODEL"],
                     cfg["OLLAMA_BASE_URL"]
                 )
             elif use_openai:
-                summary_block = summarize_openai(
+                summary_block, summary_model_used = summarize_openai(
                     info["text"], 
                     cfg["OPENAI_API_KEY"], 
-                    cfg["OPENAI_MODEL"]
+                    cfg["OPENAI_MODEL"],
+                    cfg.get("OPENAI_BASE_URL")
                 )
             else:
                 summary_block = summarize_local_textrank(info["text"], sentences=6)
-            save_markdown(out_dir, v, info, summary_block, youtube)
+            if should_log_level("INFO", cfg["LOG_LEVEL"]):
+                summary_elapsed = time.perf_counter() - summary_started_at
+                summary_chars = len(summary_block or "")
+                log_message(
+                    f"[stage] summary_done video={vid} backend={summary_backend} model={summary_model_used} elapsed={summary_elapsed:.2f}s summary_chars={summary_chars}"
+                )
+            save_started_at = time.perf_counter()
+            save_markdown(out_dir, v, info, summary_block, summary_model_used, youtube)
+            if should_log_level("INFO", cfg["LOG_LEVEL"]):
+                save_elapsed = time.perf_counter() - save_started_at
+                total_elapsed = time.perf_counter() - video_started_at
+                log_message(
+                    f"[stage] save_done video={vid} elapsed={save_elapsed:.2f}s total_elapsed={total_elapsed:.2f}s"
+                )
             saved += 1
             run_stats["success_saved"] += 1
             if not args.skip_state:
@@ -1356,9 +1716,15 @@ def main():
                     title=v.get("title"),
                     channel=v.get("videoOwnerChannelTitle", v.get("channelTitle")),
                 )
+            if should_log_level("INFO", cfg["LOG_LEVEL"]):
+                total_elapsed = time.perf_counter() - video_started_at
+                log_message(f"[video-done] {vid} outcome=saved total_elapsed={total_elapsed:.2f}s")
         except Exception as e:
             run_stats["summary_model_save_failures"] += 1
             log_message(f"[warn] failed to save/mark {vid}: {e}", file=sys.stderr)
+            if should_log_level("INFO", cfg["LOG_LEVEL"]):
+                total_elapsed = time.perf_counter() - video_started_at
+                log_message(f"[video-done] {vid} outcome=summary_or_save_error total_elapsed={total_elapsed:.2f}s", file=sys.stderr)
 
         human_pause(cfg)
 
