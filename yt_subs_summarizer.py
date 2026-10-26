@@ -760,6 +760,35 @@ def _srv3_or_ttml_to_text(xml_text: str) -> str:
             out.append(html.unescape(elem.text.strip()))
     return " ".join(out)
 
+def _json3_to_text(json3_text: str) -> str:
+    # YouTube json3 caption format: {"events": [{"segs": [{"utf8": ...}]}]}
+    try:
+        data = json.loads(json3_text)
+    except Exception:
+        return ""
+    out = []
+    for ev in data.get("events", []):
+        segs = ev.get("segs") or []
+        line = "".join(s.get("utf8", "") for s in segs).strip()
+        if line:
+            out.append(line)
+    return " ".join(out)
+
+def _caption_ext_rank(ext: str, lang: str) -> int:
+    # json3 is the only reliable format; srv3/ttml are XML fallbacks; vtt is
+    # truncated by YouTube for long videos and must be avoided for them.
+    base = {"json3": 0, "srv3": 1, "ttml": 2}.get(ext, 9)
+    return base + (10 if ext == "vtt" else 0)
+
+def _caption_is_garbage(text: str) -> bool:
+    # YouTube returns an HTML "Sorry..." rate-limit page with HTTP 200; never accept that.
+    if not text or len(text.strip()) < 40:
+        return True
+    head = text[:500].lower()
+    if "<html" in head or "sorry..." in head or "unusual traffic" in head:
+        return True
+    return False
+
 def _fetch_transcript_via_ytdlp(video_id: str, cookies_path: Optional[str], proxies: Optional[Dict[str,str]]) -> Optional[Dict[str,str]]:
     # Try Python module first, then external command if module missing
     url = f"https://www.youtube.com/watch?v={video_id}"
@@ -780,28 +809,50 @@ def _fetch_transcript_via_ytdlp(video_id: str, cookies_path: Optional[str], prox
             for lang, items in d.items():
                 if not lang.startswith("en"):
                     continue
+                manual = key == "subtitles"
                 for it in items:
                     u = it.get("url"); ext = (it.get("ext") or "").lower()
                     if u:
-                        cand.append((lang, ext, u))
-        # Prefer vtt > srv3 > ttml > json3
-        rank = {"vtt":0, "srv3":1, "ttml":2, "json3":3}
-        cand.sort(key=lambda t: rank.get(t[1], 9))
-        for lang, ext, u in cand:
+                        cand.append((lang, ext, u, manual))
+        # Prefer manual subs over auto; json3 > srv3 > ttml; vtt last (truncated on long videos)
+        cand.sort(key=lambda t: (0 if t[3] else 1, _caption_ext_rank(t[1], t[0])))
+        for lang, ext, u, manual in cand:
             raw = _fetch_url_text(u, proxies)
-            if not raw: 
+            if not raw or _caption_is_garbage(raw):
                 continue
-            if ext == "vtt":
+            if ext == "json3":
+                text = _json3_to_text(raw)
+            elif ext == "vtt":
                 text = _vtt_to_text(raw)
             else:
                 text = _srv3_or_ttml_to_text(raw)
-            if text and text.strip():
-                return {"text": text, "lang": lang, "translated": False}
+            if text and text.strip() and not _caption_is_garbage(text):
+                return {"text": text, "lang": lang, "translated": False, "manual": str(manual)}
     except Exception:
         pass
 
     # 2) External yt-dlp command is overkill here; skip to keep things simple/portable
     return None
+
+def _ytta_api_with_cookies(cookies_path: Optional[str], proxies: Optional[Dict[str,str]] = None):
+    """Build a YouTubeTranscriptApi backed by a requests.Session carrying the Netscape
+    cookies file. Without cookies, YouTube serves an anonymous timedtext track that is
+    often a garbage auto-ASR ('Foreign speech' gibberish) even when a clean manual
+    transcript exists (verified on RtDufNlHW2k: 2,218 chars junk vs 44,040 clean)."""
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0"})
+    if proxies:
+        s.proxies.update(_requests_proxies(proxies))
+    if cookies_path:
+        import http.cookiejar
+        try:
+            jar = http.cookiejar.MozillaCookieJar(os.path.expanduser(cookies_path))
+            jar.load(ignore_discard=True, ignore_expires=True)
+            s.cookies = jar
+        except Exception as e:
+            log_message(f"[warn] could not load cookies file {cookies_path}: {e}", file=sys.stderr)
+    return YouTubeTranscriptApi(http_client=s)
+
 
 def fetch_transcript_any_lang(
     video_id: str,
@@ -823,7 +874,7 @@ def fetch_transcript_any_lang(
     Returns: {"text": ..., "lang": ..., "translated": ...} OR None
     Raises: TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript (with diagnosed cause)
     """
-    api = YouTubeTranscriptApi()
+    api = _ytta_api_with_cookies(cookies_path, proxies)
     
     # --- A) List transcripts for diagnosis ---
     try:
@@ -861,7 +912,9 @@ def fetch_transcript_any_lang(
         transcript = transcript_list.find_transcript(pref_langs)
         data = transcript.fetch()
         text = " ".join(t.text.strip() for t in data if t.text.strip())
-        if text:
+        # Guard: anonymous (cookieless) timedtext can return auto-ASR gibberish even when a
+        # manual track is listed. Reject garbage and fall through to C/D/E instead of caching junk.
+        if text and not _caption_is_garbage(text):
             print(f"      [proof-of-life] {video_id} first 30 chars: {text[:30]}", file=sys.stderr)
             return {"text": text, "lang": transcript.language_code, "translated": False}
     except NoTranscriptFound:
