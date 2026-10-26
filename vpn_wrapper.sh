@@ -13,7 +13,9 @@ SERVER="${SURFSHARK_SERVER:-au-adl.prod.surfshark.com_udp.ovpn}"
 OPENVPN_BIN="${OPENVPN_BIN:-/opt/homebrew/opt/openvpn/sbin/openvpn}"
 AUTH_FILE="${SURFSHARK_AUTH_FILE:-$SURFSHARK_DIR/auth.txt}"
 OVPN_CONF="${SURFSHARK_OVPN_CONF:-$SURFSHARK_DIR/$SERVER}"
-SURFSHARK_SERVICE="${SURFSHARK_SERVICE:-Surfshark. WireGuard}"
+# Surfshark's macOS service name includes a registered-mark suffix on this host;
+# discover the connected WireGuard service instead of trusting a stale label.
+SURFSHARK_SERVICE="${SURFSHARK_SERVICE:-Surfshark. WireGuard®}"
 BASELINE_NON_VPN_IP="${BASELINE_NON_VPN_IP:-220.233.28.1}"
 LOG_DIR="$PROJECT_DIR/logs"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -159,6 +161,11 @@ if vpn_live; then
         log "Pre-existing VPN route detected. Reusing existing VPN and leaving it running afterward."
     fi
     log "Active VPN IP: $ACTIVE_IP"
+    if ! preflight_transcript_fetch; then
+        log "ERROR: Transcript preflight failed on current VPN path."
+        exit 1
+    fi
+    STATUS_PREFLIGHT_PASSED=1
 else
     log "No live VPN detected. Testing direct YouTube reachability before starting OpenVPN."
     if preflight_transcript_fetch; then
@@ -234,7 +241,7 @@ cd "$PROJECT_DIR"
 RESULT=$?
 
 if [ $RESULT -eq 0 ]; then
-    if ! joplin --profile "$CLONE_PROFILE" sync >>"$LOG_FILE" 2>&1; then
+    if ! "$HOME/.hermes/bin/joplin-3.7" --profile "$CLONE_PROFILE" sync >>"$LOG_FILE" 2>&1; then
         RESULT=$?
         log "ERROR: Clone-profile sync failed after direct import (exit code: $RESULT)"
     fi

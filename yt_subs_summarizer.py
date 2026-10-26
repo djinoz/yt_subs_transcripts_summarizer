@@ -41,9 +41,11 @@ import time
 import random
 import atexit
 import signal
+import socket
 import urllib.parse
+import urllib.error
 import urllib.request
-from typing import List, Dict, Optional, Tuple, Set
+from typing import Any, List, Dict, Optional, Tuple, Set
 
 from history_db import (
     HistoryDB,
@@ -910,7 +912,38 @@ def fetch_transcript_any_lang(
     # Final failure: No usable transcript found
     raise NoTranscriptFound(video_id, pref_langs, transcript_list)
 
-# ------------------ Summaries ------------------
+# ------------------ Transcript cache + summaries ------------------
+
+_TRANSCRIPT_CACHE_DIR = pathlib.Path(os.getenv("YT_TRANSCRIPT_CACHE_DIR", "/tmp/yt_subs_transcripts"))
+
+
+def _transcript_cache_path(video_id: str) -> pathlib.Path:
+    return _TRANSCRIPT_CACHE_DIR / f"{video_id}.json"
+
+
+def _cache_transcript(video_id: str, info: Optional[Dict[str, Any]]) -> Optional[pathlib.Path]:
+    if not info or not info.get("text"):
+        return None
+    try:
+        _TRANSCRIPT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path = _transcript_cache_path(video_id)
+        path.write_text(json.dumps({"video_id": video_id, **info}, ensure_ascii=False), encoding="utf-8")
+        return path
+    except Exception as exc:
+        log_message(f"[cache] transcript write failed video={video_id} error={type(exc).__name__}: {exc}", file=sys.stderr)
+        return None
+
+
+def _load_cached_transcript(video_id: str) -> Optional[Dict[str, str]]:
+    path = _transcript_cache_path(video_id)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("video_id") == video_id and data.get("text"):
+            return {"text": data["text"], "lang": data.get("lang", "cached"), "translated": bool(data.get("translated", False))}
+    except (OSError, ValueError, TypeError):
+        return None
+    return None
+
 
 def summarize_local_textrank(text: str, sentences: int = 5) -> str:
     try:
@@ -1018,9 +1051,11 @@ def summarize_openai(text: str, api_key: str, model: str = "gpt-4o-mini", base_u
 
     model_candidates = _candidate_model_ids(client, model, base_url)
 
-    # Cloud models can take far more input than the local Gemma OpenAI-compatible path.
-    # Retry with progressively shorter transcript slices if the backend rejects the prompt.
-    candidate_limits = [150000, 24000, 12000, 8000, 4000]
+    # Local LM Studio Gemma is configured at 100K context but becomes impractical
+    # on very large transcript prompts; cap the local path before sending a 100K+
+    # transcript. Remote/cloud routes keep the larger retry ladder.
+    local_compat = (base_url or '').rstrip('/').endswith(('127.0.0.1:8091/v1', 'localhost:8091/v1'))
+    candidate_limits = [24000, 12000, 8000, 4000] if local_compat else [150000, 24000, 12000, 8000, 4000]
     last_exc = None
     for model_name in model_candidates:
         if model_name != model:
@@ -1083,6 +1118,36 @@ def _joplin_tag_titles() -> List[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
+def _is_transient_joplin_error(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError, socket.timeout, TimeoutError)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, (TimeoutError, socket.timeout, ConnectionError)):
+            return True
+        reason_text = str(reason or "").lower()
+        return any(token in reason_text for token in (
+            "connection refused",
+            "connection reset",
+            "timed out",
+            "temporarily unavailable",
+            "broken pipe",
+            "connection aborted",
+        ))
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500
+    text = str(exc).lower()
+    return any(token in text for token in (
+        "connection error",
+        "connection refused",
+        "connection reset",
+        "timed out",
+        "temporarily unavailable",
+        "broken pipe",
+        "connection aborted",
+    ))
+
+
 def _joplin_request(method: str, path: str, payload: Optional[Dict] = None) -> Dict:
     base_url = os.getenv("JOPLIN_API_URL", "http://127.0.0.1:41184").rstrip("/")
     token = os.getenv("JOPLIN_API_TOKEN", "").strip()
@@ -1098,13 +1163,30 @@ def _joplin_request(method: str, path: str, payload: Optional[Dict] = None) -> D
         body = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
 
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=30) as response:
-        raw = response.read().decode("utf-8")
-    return json.loads(raw) if raw else {}
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 2 or not _is_transient_joplin_error(exc):
+                raise
+            time.sleep(1.5 * (attempt + 1))
+    raise last_exc or RuntimeError(f"Joplin request failed for {method} {path}")
 
 
 def _joplin_find_existing_note(video: Dict, note_title: str, folder_id: str) -> Optional[Dict]:
+    """Find the canonical imported note, including empty Joplin placeholders.
+
+    Joplin can contain a title-only placeholder created by another importer before
+    the summarizer writes the body.  Treating that placeholder as new is what
+    produced the observed title duplicates.  Durable video_id matches win; an
+    exact-title empty placeholder is the safe final fallback inside the dedicated
+    YouTube Import folder.
+    """
     video_id = str(video.get("videoId", "")).strip()
     page = 1
     candidates: List[Dict] = []
@@ -1114,26 +1196,34 @@ def _joplin_find_existing_note(video: Dict, note_title: str, folder_id: str) -> 
             "GET",
             f"/folders/{folder_id}/notes?fields=id,title,parent_id,source_application&limit=100&page={page}",
         )
-        items = note_page.get("items", [])
-        candidates.extend(items)
+        candidates.extend(note_page.get("items", []))
         if not note_page.get("has_more"):
             break
         page += 1
 
+    exact_title_empty: Optional[Dict] = None
+    exact_title_imported: Optional[Dict] = None
     for item in candidates:
         note_id = item.get("id")
         if not note_id:
             continue
-        if item.get("title") != note_title and not video_id:
+        if item.get("title") != note_title and video_id:
+            # A video-id match may have a title changed by a later editor.
+            full = _joplin_request("GET", f"/notes/{note_id}?fields=id,title,parent_id,body,source_application")
+            body = full.get("body") or ""
+            if re.search(rf"(?im)^video_id\s*:\s*['\"]?{re.escape(video_id)}['\"]?(?:\s|$)", body):
+                return full
             continue
         full = _joplin_request("GET", f"/notes/{note_id}?fields=id,title,parent_id,body,source_application")
         body = full.get("body") or ""
-        if video_id and f'video_id: "{video_id}"' in body:
+        if video_id and re.search(rf"(?im)^video_id\s*:\s*['\"]?{re.escape(video_id)}['\"]?(?:\s|$)", body):
             return full
-        if full.get("title") == note_title and full.get("source_application") == "yt_subs_transcripts_summarizer":
-            return full
+        if full.get("source_application") == "yt_subs_transcripts_summarizer":
+            exact_title_imported = exact_title_imported or full
+        elif not body.strip():
+            exact_title_empty = exact_title_empty or full
 
-    return None
+    return exact_title_imported or exact_title_empty
 
 
 def save_joplin_note(video: Dict, md: str, note_title: str) -> str:
@@ -1150,46 +1240,57 @@ def save_joplin_note(video: Dict, md: str, note_title: str) -> str:
         "source_application": "yt_subs_transcripts_summarizer",
     }
 
-    existing = _joplin_find_existing_note(video, note_title, folder_id)
-    if existing and existing.get("id"):
-        note_id = existing["id"]
-        _joplin_request("PUT", f"/notes/{note_id}", note_payload)
-    else:
-        created = _joplin_request("POST", "/notes", note_payload)
-        note_id = created.get("id")
-        if not note_id:
-            raise RuntimeError(f"Joplin API did not return a note id for title: {note_title}")
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            existing = _joplin_find_existing_note(video, note_title, folder_id)
+            if existing and existing.get("id"):
+                note_id = existing["id"]
+                _joplin_request("PUT", f"/notes/{note_id}", note_payload)
+            else:
+                created = _joplin_request("POST", "/notes", note_payload)
+                note_id = created.get("id")
+                if not note_id:
+                    raise RuntimeError(f"Joplin API did not return a note id for title: {note_title}")
 
-    all_tags: List[Dict] = []
-    page = 1
-    while True:
-        tag_page = _joplin_request("GET", f"/tags?fields=id,title&limit=100&page={page}")
-        all_tags.extend(tag_page.get("items", []))
-        if not tag_page.get("has_more"):
-            break
-        page += 1
-    tag_ids_by_title = {tag.get("title"): tag.get("id") for tag in all_tags if tag.get("id")}
+            all_tags: List[Dict] = []
+            page = 1
+            while True:
+                tag_page = _joplin_request("GET", f"/tags?fields=id,title&limit=100&page={page}")
+                all_tags.extend(tag_page.get("items", []))
+                if not tag_page.get("has_more"):
+                    break
+                page += 1
+            tag_ids_by_title = {tag.get("title"): tag.get("id") for tag in all_tags if tag.get("id")}
 
-    note_tags = _joplin_request("GET", f"/notes/{note_id}/tags?fields=id,title")
-    note_tag_titles = {tag.get("title") for tag in note_tags.get("items", [])}
+            note_tags = _joplin_request("GET", f"/notes/{note_id}/tags?fields=id,title")
+            note_tag_titles = {tag.get("title") for tag in note_tags.get("items", [])}
 
-    for tag_title in _joplin_tag_titles():
-        tag_id = tag_ids_by_title.get(tag_title)
-        if not tag_id:
-            tag = _joplin_request("POST", "/tags", {"title": tag_title})
-            tag_id = tag.get("id")
-            if not tag_id:
-                raise RuntimeError(f"Joplin API did not return a tag id for tag: {tag_title}")
-            tag_ids_by_title[tag_title] = tag_id
-        if tag_title not in note_tag_titles:
-            _joplin_request("POST", f"/tags/{tag_id}/notes", {"id": note_id})
+            for tag_title in _joplin_tag_titles():
+                tag_id = tag_ids_by_title.get(tag_title)
+                if not tag_id:
+                    tag = _joplin_request("POST", "/tags", {"title": tag_title})
+                    tag_id = tag.get("id")
+                    if not tag_id:
+                        raise RuntimeError(f"Joplin API did not return a tag id for tag: {tag_title}")
+                    tag_ids_by_title[tag_title] = tag_id
+                if tag_title not in note_tag_titles:
+                    _joplin_request("POST", f"/tags/{tag_id}/notes", {"id": note_id})
 
-    read_back = _joplin_request("GET", f"/notes/{note_id}?fields=id,title,parent_id,is_todo,body")
-    if read_back.get("title") != note_title or read_back.get("parent_id") != folder_id:
-        raise RuntimeError(f"Joplin note read-back verification failed for note {note_id}")
-    if not (read_back.get("body") or "").startswith(f"# {html.unescape(video['title'])}"):
-        raise RuntimeError(f"Joplin note body verification failed for note {note_id}")
-    return note_id
+            read_back = _joplin_request("GET", f"/notes/{note_id}?fields=id,title,parent_id,is_todo,body")
+            if read_back.get("title") != note_title or read_back.get("parent_id") != folder_id:
+                raise RuntimeError(f"Joplin note read-back verification failed for note {note_id}")
+            if not (read_back.get("body") or "").startswith(f"# {html.unescape(video['title'])}"):
+                raise RuntimeError(f"Joplin note body verification failed for note {note_id}")
+            return note_id
+        except Exception as exc:
+            last_exc = exc
+            if attempt == 2 or not _is_transient_joplin_error(exc):
+                raise
+            log_message(f"[warn] transient Joplin save failure for {video.get('videoId', note_title)} attempt={attempt + 1}: {exc}", file=sys.stderr)
+            time.sleep(2 * (attempt + 1))
+
+    raise last_exc or RuntimeError(f"Joplin save failed for note: {note_title}")
 
 
 def save_markdown(
@@ -1286,11 +1387,9 @@ def main():
     use_openai = bool(cfg["OPENAI_API_KEY"]) and not use_ollama
 
     history_mode = get_history_mode(args)
+    # One lock for every mode: subscription and playlist runs share the same
+    # Joplin destination and must not race between scan and note creation.
     lock_path = cfg["RUN_LOCK_FILE"]
-    if history_mode == MODE_PLAYLIST:
-        lock_path = f"{lock_path}.playlist"
-    elif history_mode == MODE_URLS:
-        lock_path = f"{lock_path}.urls"
     acquired_lock = acquire_run_lock(lock_path)
     if should_log_level("INFO", cfg["LOG_LEVEL"]):
         log_message(f"[lock] acquired {acquired_lock}")
@@ -1587,11 +1686,19 @@ def main():
                         transcript_elapsed = time.perf_counter() - transcript_started_at
                         transcript_chars = len(info.get("text", "")) if info else 0
                         transcript_lang = info.get("lang", "unknown") if info else "unknown"
-                        log_message(
-                            f"[stage] transcript_ready video={vid} elapsed={transcript_elapsed:.2f}s chars={transcript_chars} lang={transcript_lang}"
-                        )
+                        log_message(f"[stage] transcript_ready video={vid} elapsed={transcript_elapsed:.2f}s chars={transcript_chars} lang={transcript_lang}")
+                    if info:
+                        cache_path = _cache_transcript(vid, info)
+                        if should_log_level("INFO", cfg["LOG_LEVEL"]):
+                            log_message(f"[cache] transcript_cached video={vid} path={cache_path or 'none'} chars={len(info.get('text', ''))}")
                     break
                 except Exception as e:
+                    if attempt == attempts:
+                        cached_info = _load_cached_transcript(vid)
+                        if cached_info:
+                            info = cached_info
+                            log_message(f"[recovery] using cached transcript video={vid} path={_transcript_cache_path(vid)} chars={len(info['text'])}", file=sys.stderr)
+                            break
                     if is_request_blocked_error(e):
                         try:
                             blocked_ip = requests.get("https://api.ipify.org", timeout=5).text.strip()

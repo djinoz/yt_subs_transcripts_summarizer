@@ -1,7 +1,10 @@
 #!/bin/bash
 # Process videos from "yt-summariser" playlist (user-curated queue)
 # Ignores age limits - processes any video in the playlist once only
-# NOTE: VPN removed - YouTube transcript API blocks known VPN IP ranges (see MEMORY.md 2026-02-08)
+# NOTE (corrected 2026-10-26): Surfshark VPN is REQUIRED and stays connected system-wide
+# (currently Dausos/WireGuard via Auckland; egress checked in run logs, e.g. 62.93.164.244).
+# The old "VPN IPs get blocked by YouTube" note (MEMORY.md 2026-02-08) was from the Adelaide
+# OpenVPN era and is stale — runs through the NZ tunnel succeed with request_blocked=0.
 
 set -e
 
@@ -47,7 +50,7 @@ python3 yt_subs_summarizer.py \
 RESULT=${PIPESTATUS[0]}
 
 if [ $RESULT -eq 0 ]; then
-    if ! joplin --profile "$CLONE_PROFILE" sync >>"$LOG_FILE" 2>&1; then
+    if ! "$HOME/.hermes/bin/joplin-3.7" --profile "$CLONE_PROFILE" sync >>"$LOG_FILE" 2>&1; then
         RESULT=$?
         echo "[$(date)] ❌ Playlist queue sync failed (exit code: $RESULT)" | tee -a "$LOG_FILE"
     else
